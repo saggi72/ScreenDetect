@@ -1,2 +1,2 @@
 # ScreenDetect
-python, OpenCv
+python, OpenCv, QT Designer
