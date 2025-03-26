@@ -1,0 +1,2194 @@
+# ScreenDetect Yolo _ Open CV
+# -*- coding: utf-8 -*-
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import (QFileDialog, QLabel, QGraphicsView, QGraphicsScene,
+                             QMessageBox, QWidget, QTextEdit,
+                             QSpinBox, QDoubleSpinBox, QComboBox, QPushButton,
+                             QSizePolicy, QGroupBox)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+import cv2
+import numpy as np
+import sys
+import os
+import time
+import json
+from queue import Queue, Empty
+import traceback
+import serial
+import serial.tools.list_ports
+from enum import Enum, auto
+
+# --- Thử import YOLOv8 ---
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO = None
+    YOLO_AVAILABLE = False
+    # In cảnh báo ra console một lần khi khởi động
+    print("WARNING: Thư viện 'ultralytics' (YOLOv8) chưa được cài đặt. Chức năng YOLO sẽ bị vô hiệu hóa.")
+    print("         Vui lòng cài đặt bằng lệnh: pip install ultralytics")
+
+# --- Hằng số ---
+METHOD_SSIM = "OpenCV SSIM"
+METHOD_YOLO = "YOLOv8 Detection"
+
+class ComparisonStatus(Enum):
+    NORMAL = auto()
+    SHUTDOWN = auto()
+    FAIL = auto()
+    UNKNOWN = auto()
+    ERROR = auto()
+
+STATUS_MAP = {
+    ComparisonStatus.NORMAL: {"label": "Normal", "color": "lightgreen", "log_prefix": "✅", "serial": "Norm"},
+    ComparisonStatus.SHUTDOWN: {"label": "Shutdown", "color": "lightblue", "log_prefix": "ℹ️", "serial": "Shutdown"},
+    ComparisonStatus.FAIL: {"label": "FAIL!", "color": "red", "log_prefix": "❌", "serial": "Fail"},
+    ComparisonStatus.UNKNOWN: {"label": "Unknown Mismatch", "color": "orange", "log_prefix": "⚠️", "serial": None},
+    ComparisonStatus.ERROR: {"label": "Comparison Error", "color": "magenta", "log_prefix": "💥", "serial": None},
+}
+
+REF_NORM = "Norm"
+REF_SHUTDOWN = "Shutdown"
+REF_FAIL = "Fail"
+DEFAULT_SSIM_THRESHOLD = 0.90
+DEFAULT_ERROR_COOLDOWN = 15
+DEFAULT_RUNTIME_MINUTES = 0
+DEFAULT_RECORD_ON_ERROR = False
+DEFAULT_SERIAL_ENABLED = False
+DEFAULT_BAUD_RATE = 9600
+CONFIG_FILE_NAME = "image_checker_config.json"
+LOG_FILE_NAME = "activity_log.txt"
+VIDEO_SUBFOLDER = "error_videos"
+COMMON_BAUD_RATES = [9600, 19200, 38400, 57600, 115200]
+DEFAULT_COMPARISON_METHOD = METHOD_SSIM
+DEFAULT_YOLO_CONFIDENCE = 0.5
+
+# --- Hàm SSIM ---
+def ssim_opencv(img1, img2, K1=0.01, K2=0.03, win_size=7, data_range=255.0):
+    if img1 is None or img2 is None: return None
+    try:
+        if len(img1.shape) > 2: img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        if len(img2.shape) > 2: img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+        if img1.shape != img2.shape:
+            h1, w1 = img1.shape[:2]
+            h2, w2 = img2.shape[:2]
+            interpolation = cv2.INTER_AREA if (w2 > w1 or h2 > h1) else cv2.INTER_LINEAR
+            img2 = cv2.resize(img2, (w1, h1), interpolation=interpolation)
+            if img2 is None or img2.shape != (h1, w1):
+                print("Warning: SSIM resize failed")
+                return None
+
+        h, w = img1.shape
+        win_size = min(win_size, h, w)
+        if win_size % 2 == 0: win_size -= 1
+        win_size = max(3, win_size)
+        if h < win_size or w < win_size: return None
+
+        if img1.dtype != np.float64: img1 = img1.astype(np.float64)
+        if img2.dtype != np.float64: img2 = img2.astype(np.float64)
+
+        C1 = (K1 * data_range)**2
+        C2 = (K2 * data_range)**2
+        sigma = 1.5
+        mu1 = cv2.GaussianBlur(img1, (win_size, win_size), sigma)
+        mu2 = cv2.GaussianBlur(img2, (win_size, win_size), sigma)
+        mu1_sq = mu1 * mu1
+        mu2_sq = mu2 * mu2
+        mu1_mu2 = mu1 * mu2
+        sigma1_sq = cv2.GaussianBlur(img1 * img1, (win_size, win_size), sigma) - mu1_sq
+        sigma2_sq = cv2.GaussianBlur(img2 * img2, (win_size, win_size), sigma) - mu2_sq
+        sigma12 = cv2.GaussianBlur(img1 * img2, (win_size, win_size), sigma) - mu1_mu2
+        numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+        denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim_map = numerator / (denominator + 1e-8)
+        ssim_map = np.clip(ssim_map, 0, 1)
+        mssim = np.mean(ssim_map)
+        if not np.isfinite(mssim): return None
+        return mssim
+
+    except cv2.error as cv_err:
+        print(f"OpenCV Error in SSIM: {cv_err}")
+        return None
+    except Exception as e:
+        print(f"General Error in SSIM: {e}")
+        traceback.print_exc()
+        return None
+
+# --- Worker Thread ---
+# ... (ProcessingWorker class giữ nguyên như trước - không có lỗi cú pháp rõ ràng) ...
+class ProcessingWorker(QThread):
+    log_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(ComparisonStatus, object)
+    save_error_signal = pyqtSignal(np.ndarray, str)
+    comparison_details_signal = pyqtSignal(dict)
+    error_detected_signal = pyqtSignal()
+    serial_command_signal = pyqtSignal(str)
+
+    def __init__(self, frame_queue, ref_data_provider, config_provider, compare_function):
+        super().__init__()
+        self.frame_queue = frame_queue
+        self.get_ref_data = ref_data_provider
+        self.get_config = config_provider
+        self.compare_images_func = compare_function
+        self.running = False
+        self.last_error_time = 0
+        self.last_emitted_serial_state = None
+        self.last_status = None
+
+    def run(self):
+        self.running = True
+        self.log_signal.emit("⚙️ Worker started.")
+        last_status_log_time = 0
+        error_signaled_this_session = False
+        self.last_emitted_serial_state = None
+        self.last_status = None
+
+        while self.running:
+            try:
+                frame = self.frame_queue.get(timeout=0.5)
+            except Empty:
+                if not self.running: break
+                continue
+            except Exception as e:
+                self.log_signal.emit(f"❌ Error getting frame from queue: {e}")
+                continue
+
+            if not self.running: break
+
+            try:
+                cfg = self.get_config()
+                err_cd = cfg.get('error_cooldown', DEFAULT_ERROR_COOLDOWN)
+                err_f = cfg.get('error_folder')
+                ref_data = self.get_ref_data()
+
+                current_status, details = self.compare_images_func(frame, ref_data, cfg)
+                self.comparison_details_signal.emit(details or {})
+
+                status_info = STATUS_MAP.get(current_status, STATUS_MAP[ComparisonStatus.ERROR])
+                status_label = status_info["label"]
+                status_color = status_info["color"]
+                log_prefix = status_info["log_prefix"]
+                serial_cmd = status_info["serial"]
+
+                log_msg = f"{log_prefix} Status: {status_label}"
+                detail_str = ""
+                if details:
+                    if 'detected' in details:
+                        det_items = sorted([f"{k}:{v}" for k,v in details['detected'].items()])
+                        detail_str = f"Detect: {', '.join(det_items) if det_items else 'None'}"
+                        if 'count' in details: detail_str += f" (Total: {details['count']})"
+                    elif 'ssim_norm' in details:
+                        detail_str = f"SSIM: {details['ssim_norm']:.4f}"
+                    if 'reason' in details: detail_str += f" (Reason: {details['reason']})"
+                    elif 'error' in details: detail_str += f" (Error: {details['error']})"
+                    if detail_str: log_msg += f" ({detail_str})"
+
+                needs_logging = True
+                current_time_log = time.time()
+                if current_status == ComparisonStatus.NORMAL:
+                    if current_time_log - last_status_log_time < 5.0: needs_logging = False
+                    else: last_status_log_time = current_time_log
+                else:
+                    last_status_log_time = 0
+                    if self.last_status == current_status: needs_logging = False
+
+                if needs_logging: self.log_signal.emit(log_msg)
+
+                if self.last_status != current_status:
+                    self.status_signal.emit(current_status, details or {})
+                    self.last_status = current_status
+
+                is_problem_state = current_status in [ComparisonStatus.FAIL, ComparisonStatus.UNKNOWN, ComparisonStatus.ERROR]
+                should_save_img = is_problem_state
+                should_record = is_problem_state
+
+                if should_record and not error_signaled_this_session:
+                    self.error_detected_signal.emit()
+                    error_signaled_this_session = True
+
+                if serial_cmd and self.last_emitted_serial_state != serial_cmd:
+                    self.serial_command_signal.emit(serial_cmd)
+                    self.last_emitted_serial_state = serial_cmd
+                elif not serial_cmd and self.last_emitted_serial_state:
+                    self.last_emitted_serial_state = None
+
+                current_time_save = time.time()
+                if should_save_img and err_f and (current_time_save - self.last_error_time > err_cd):
+                    try:
+                        err_sub = status_label.lower().replace("!", "").replace(" ", "_").replace(":", "")
+                        save_folder = os.path.join(err_f, err_sub)
+                        os.makedirs(save_folder, exist_ok=True)
+                        timestamp = time.strftime('%Y%m%d_%H%M%S') + f"_{int((current_time_save - int(current_time_save)) * 1000):03d}"
+                        filename = f"{err_sub}_{timestamp}.png"
+                        filepath = os.path.join(save_folder, filename)
+                        self.save_error_signal.emit(frame.copy(), filepath)
+                        self.last_error_time = current_time_save
+                    except Exception as e:
+                        self.log_signal.emit(f"❌ Lỗi khi chuẩn bị lưu ảnh lỗi: {e}")
+                elif not err_f and should_save_img:
+                    pass
+
+                sleep_time = 0.05 if current_status == ComparisonStatus.NORMAL else 0.1
+                time.sleep(sleep_time)
+
+            except Exception as e:
+                self.log_signal.emit(f"💥 Lỗi nghiêm trọng trong worker logic: {e}")
+                self.log_signal.emit(traceback.format_exc())
+                try:
+                    self.status_signal.emit(ComparisonStatus.ERROR, {"error": str(e)})
+                except Exception as sig_e:
+                    print(f"CRITICAL: Failed to emit error status signal: {sig_e}")
+                self.last_status = ComparisonStatus.ERROR
+                time.sleep(0.5)
+
+        self.log_signal.emit("⚙️ Worker finished.")
+        self.last_emitted_serial_state = None
+        error_signaled_this_session = False
+        self.last_status = None
+
+    def stop(self):
+        self.running = False
+        self.log_signal.emit("⚙️ Đang yêu cầu dừng worker...")
+
+# --- Main Application Window ---
+class ImageCheckerApp(QtWidgets.QMainWindow):
+    # --- __init__ và các hàm provider giữ nguyên ---
+    def __init__(self):
+        super().__init__()
+        # --- State Variables ---
+        self.cap = None
+        self.webcam_fps = 15.0
+        self.frame_timer = QTimer(self)
+        self.ref_data = {k: None for k in [REF_NORM, REF_SHUTDOWN, REF_FAIL]}
+        self.yolo_model = None
+        self.webcam_roi = None
+        self.processing = False
+        self.error_folder = None
+        self.log_file_path = None
+        self.pixmap_item = None
+        self.runtime_timer = QTimer(self)
+        self._current_runtime_minutes = DEFAULT_RUNTIME_MINUTES
+        self._current_ssim_threshold = DEFAULT_SSIM_THRESHOLD
+        self._current_error_cooldown = DEFAULT_ERROR_COOLDOWN
+        self._record_on_error_enabled = DEFAULT_RECORD_ON_ERROR
+        self.video_writer = None
+        self.current_video_path = None
+        self.error_occurred_during_recording = False
+        self.serial_port = None
+        self.serial_port_name = None
+        self.serial_baud_rate = DEFAULT_BAUD_RATE
+        self.serial_enabled = DEFAULT_SERIAL_ENABLED
+        self.current_comparison_method = DEFAULT_COMPARISON_METHOD
+
+        self.comparison_functions = {
+            METHOD_SSIM: self.compare_ssim_strategy,
+            METHOD_YOLO: self.compare_yolo_strategy,
+        }
+
+        self.config = {
+            'comparison_method': self.current_comparison_method,
+            'ssim_threshold': self._current_ssim_threshold,
+            'error_cooldown': self._current_error_cooldown,
+            'runtime_duration_minutes': self._current_runtime_minutes,
+            'record_on_error': self._record_on_error_enabled,
+            'error_folder': None,
+            'ref_paths': {k: None for k in [REF_NORM, REF_SHUTDOWN, REF_FAIL]},
+            'webcam_roi': None,
+            'serial_port': self.serial_port_name,
+            'serial_baud': self.serial_baud_rate,
+            'serial_enabled': self.serial_enabled,
+            'yolo_model_path': None,
+            'yolo_confidence': DEFAULT_YOLO_CONFIDENCE,
+        }
+
+        self.frame_timer.timeout.connect(self.update_frame)
+        self.runtime_timer.setSingleShot(True)
+        self.runtime_timer.timeout.connect(self._runtime_timer_timeout)
+        self.frame_queue = Queue(maxsize=10)
+        self.processing_worker = None
+
+        self.init_ui()
+        self.load_config()
+        self._refresh_com_ports()
+        self.log_activity("Ứng dụng khởi động.")
+        self.update_all_ui_elements()
+        if self.current_comparison_method == METHOD_YOLO and self.config.get('yolo_model_path'):
+            QTimer.singleShot(150, self._load_yolo_model)
+
+    def get_current_config_for_worker(self):
+        return {
+            'error_cooldown': self._current_error_cooldown,
+            'error_folder': self.error_folder,
+            'comparison_method': self.current_comparison_method,
+            'ssim_threshold': self._current_ssim_threshold,
+            'yolo_confidence': self.config.get('yolo_confidence', DEFAULT_YOLO_CONFIDENCE),
+        }
+
+    def get_reference_data_for_worker(self):
+        if self.current_comparison_method == METHOD_SSIM:
+            return {k: (img.copy() if isinstance(img, np.ndarray) else None) for k, img in self.ref_data.items()}
+        elif self.current_comparison_method == METHOD_YOLO:
+            # --- Định nghĩa quy tắc YOLO tại đây ---
+            return {
+                REF_NORM: {"required_objects": ["person"], "min_counts": {"person": 1}, "exact_total_objects": 1, "forbidden_objects": ["alert"]},
+                REF_SHUTDOWN: {"forbidden_objects": ["person"], "max_total_objects": 0},
+                REF_FAIL: {"any_of": ["alert", "warning"]},
+            }
+        else:
+            return {}
+
+    # --- Config Update Slots giữ nguyên ---
+    @QtCore.pyqtSlot(float)
+    def _update_threshold_config(self, value):
+        if abs(self._current_ssim_threshold - value) > 1e-4:
+            self._current_ssim_threshold = value
+            self.log_activity(f"⚙️ Ngưỡng SSIM: {value:.3f}")
+            self.config['ssim_threshold'] = value
+
+    @QtCore.pyqtSlot(int)
+    def _update_cooldown_config(self, value):
+        if self._current_error_cooldown != value:
+            self._current_error_cooldown = value
+            self.log_activity(f"⚙️ Cooldown Lỗi: {value}s")
+            self.config['error_cooldown'] = value
+
+    @QtCore.pyqtSlot(int)
+    def _update_runtime_config(self, value):
+        if self._current_runtime_minutes != value:
+            self._current_runtime_minutes = value
+            log_msg = f"⚙️ Thời gian chạy: {'Vô hạn' if value == 0 else f'{value} phút'}"
+            self.log_activity(log_msg)
+            self.config['runtime_duration_minutes'] = value
+
+    @QtCore.pyqtSlot()
+    def _toggle_record_on_error(self):
+        if self.processing:
+             QMessageBox.warning(self,"Đang Xử Lý","Không thể thay đổi khi đang xử lý.")
+             return
+        self._record_on_error_enabled = not self._record_on_error_enabled
+        self.config['record_on_error'] = self._record_on_error_enabled
+        self.update_record_button_style()
+        self.log_activity(f"⚙️ Ghi video lỗi: {'Bật' if self._record_on_error_enabled else 'Tắt'}")
+
+    @QtCore.pyqtSlot(str)
+    def _update_serial_port_config(self, port_name):
+        new_port = port_name if port_name and "Không tìm thấy" not in port_name else None
+        if self.serial_port_name != new_port:
+             self.serial_port_name = new_port
+             self.config['serial_port'] = self.serial_port_name
+             self.log_activity(f"⚙️ Cổng COM: {self.serial_port_name or 'Chưa chọn'}")
+             if self.serial_enabled: self.log_activity("⚠️ Thay đổi cổng COM yêu cầu Kết nối lại.")
+
+    @QtCore.pyqtSlot(str)
+    def _update_serial_baud_config(self, baud_str):
+        try:
+            bd = int(baud_str)
+            if self.serial_baud_rate != bd:
+                if bd in COMMON_BAUD_RATES:
+                    self.serial_baud_rate = bd
+                    self.config['serial_baud'] = bd
+                    self.log_activity(f"⚙️ Baud rate: {bd}")
+                    if self.serial_enabled: self.log_activity("⚠️ Thay đổi Baud rate yêu cầu Kết nối lại.")
+                else:
+                     self.log_activity(f"⚠️ Baud rate không hợp lệ: {bd}. Sử dụng giá trị cũ: {self.serial_baud_rate}")
+                     idx = self.baudRateComboBox.findText(str(self.serial_baud_rate))
+                     if idx >= 0: self.baudRateComboBox.blockSignals(True); self.baudRateComboBox.setCurrentIndex(idx); self.baudRateComboBox.blockSignals(False)
+        except ValueError:
+            self.log_activity(f"⚠️ Giá trị Baud rate nhập vào không phải số: {baud_str}")
+            idx = self.baudRateComboBox.findText(str(self.serial_baud_rate))
+            if idx >= 0: self.baudRateComboBox.blockSignals(True); self.baudRateComboBox.setCurrentIndex(idx); self.baudRateComboBox.blockSignals(False)
+
+    @QtCore.pyqtSlot(str)
+    def _update_comparison_method_config(self, method_name):
+        if self.processing:
+            self.log_activity("⚠️ Không thể thay đổi phương thức khi đang xử lý.")
+            self.comparisonMethodComboBox.blockSignals(True)
+            self.comparisonMethodComboBox.setCurrentText(self.current_comparison_method)
+            self.comparisonMethodComboBox.blockSignals(False)
+            return
+
+        if method_name in self.comparison_functions and self.current_comparison_method != method_name:
+            if method_name == METHOD_YOLO and not YOLO_AVAILABLE:
+                 QMessageBox.critical(self, "Lỗi Thiếu Thư Viện", "Không tìm thấy thư viện YOLOv8 (ultralytics).")
+                 self.comparisonMethodComboBox.blockSignals(True)
+                 self.comparisonMethodComboBox.setCurrentText(self.current_comparison_method)
+                 self.comparisonMethodComboBox.blockSignals(False)
+                 return
+
+            self.current_comparison_method = method_name
+            self.config['comparison_method'] = method_name
+            self.log_activity(f"⚙️ Phương thức so sánh: {method_name}")
+            self._update_method_specific_ui()
+            if method_name == METHOD_YOLO and self.config.get('yolo_model_path'):
+                # Tải model (có thể tách ra thành hàm riêng nếu phức tạp)
+                self._load_yolo_model()
+
+    @QtCore.pyqtSlot(float)
+    def _update_yolo_confidence_config(self, value):
+         current_conf = self.config.get('yolo_confidence', DEFAULT_YOLO_CONFIDENCE)
+         if abs(current_conf - value) > 1e-4: # So sánh số thực
+             self.config['yolo_confidence'] = value
+             self.log_activity(f"⚙️ Ngưỡng tin cậy YOLO: {value:.2f}")
+
+    # --- init_ui ---
+    def init_ui(self):
+        """Khởi tạo giao diện người dùng."""
+        self.setWindowTitle("Image Checker v3.0 (YOLOv8 Fixed)")
+        self.setGeometry(100, 100, 1350, 820) # Kích thước cửa sổ
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+
+        # --- Panel Trái: Hiển thị Webcam và Nút điều khiển cơ bản ---
+        self.scene = QGraphicsScene(self)
+        self.graphicsView = QGraphicsView(self.scene, central_widget)
+        self.graphicsView.setGeometry(10, 10, 640, 360)
+        self.graphicsView.setStyleSheet("border: 1px solid black;")
+        self.graphicsView.setBackgroundBrush(QtGui.QBrush(Qt.darkGray))
+
+        # Kích thước và vị trí nút
+        bw, bh, vs, bx, yp = 201, 31, 40, 20, 380 # width, height, vertical_space, x_pos, y_start_pos
+        # Webcam Controls
+        self.ONCam = self.create_button("📷 Bật Webcam"); self.ONCam.setGeometry(bx, yp, bw, bh); self.ONCam.clicked.connect(self.start_webcam)
+        self.OFFCam = self.create_button("🚫 Tắt Webcam"); self.OFFCam.setGeometry(bx + bw + 10, yp, bw, bh); self.OFFCam.clicked.connect(self.stop_webcam); self.OFFCam.setEnabled(False); yp += vs
+        # Load Reference Image Buttons (for SSIM)
+        self.SettingButton_Norm = self.create_button("📂 Ảnh Norm (SSIM)"); self.SettingButton_Norm.setGeometry(bx, yp, bw, bh); self.SettingButton_Norm.clicked.connect(lambda: self.load_reference_image(REF_NORM))
+        self.SettingButton_Shutdown = self.create_button("📂 Ảnh Shutdown (SSIM)"); self.SettingButton_Shutdown.setGeometry(bx + bw + 10, yp, bw, bh); self.SettingButton_Shutdown.clicked.connect(lambda: self.load_reference_image(REF_SHUTDOWN))
+        self.SettingButton_Fail = self.create_button("📂 Ảnh Fail (SSIM)"); self.SettingButton_Fail.setGeometry(bx + 2 * (bw + 10), yp, bw, bh); self.SettingButton_Fail.clicked.connect(lambda: self.load_reference_image(REF_FAIL)); yp += vs
+        # Capture Reference Image Buttons (for SSIM)
+        self.CaptureButton_Norm = self.create_button("📸 Chụp Norm (SSIM)"); self.CaptureButton_Norm.setGeometry(bx, yp, bw, bh); self.CaptureButton_Norm.clicked.connect(lambda: self.capture_reference_from_webcam(REF_NORM)); self.CaptureButton_Norm.setEnabled(False)
+        self.CaptureButton_Shut = self.create_button("📸 Chụp Shutdown (SSIM)"); self.CaptureButton_Shut.setGeometry(bx + bw + 10, yp, bw, bh); self.CaptureButton_Shut.clicked.connect(lambda: self.capture_reference_from_webcam(REF_SHUTDOWN)); self.CaptureButton_Shut.setEnabled(False)
+        self.CaptureButton_Fail = self.create_button("📸 Chụp Fail (SSIM)"); self.CaptureButton_Fail.setGeometry(bx + 2 * (bw + 10), yp, bw, bh); self.CaptureButton_Fail.clicked.connect(lambda: self.capture_reference_from_webcam(REF_FAIL)); self.CaptureButton_Fail.setEnabled(False); yp += vs
+        # ROI, Save Folder, Start/Stop Buttons
+        self.SettingButton_ROI_Webcam = self.create_button("✂️ Chọn ROI"); self.SettingButton_ROI_Webcam.setGeometry(bx, yp, bw, bh); self.SettingButton_ROI_Webcam.clicked.connect(self.select_webcam_roi); self.SettingButton_ROI_Webcam.setEnabled(False)
+        self.SaveButton = self.create_button("📁 Thư mục lỗi"); self.SaveButton.setGeometry(bx + bw + 10, yp, bw, bh); self.SaveButton.clicked.connect(self.select_error_folder)
+        self.ToggleProcessingButton = self.create_button("▶️ Bắt đầu"); self.ToggleProcessingButton.setGeometry(bx + 2 * (bw + 10), yp, bw, bh); self.ToggleProcessingButton.clicked.connect(self.toggle_processing); yp += vs
+        # Exit Button
+        self.ExitButton = self.create_button("🚪 Thoát"); self.ExitButton.setGeometry(bx, yp, bw, bh); self.ExitButton.clicked.connect(self.close_application)
+
+
+        # --- Panel Phải: Log, Trạng thái, Cấu hình ---
+        rx = 670 # X-start for right panel
+        lw = self.geometry().width() - rx - 20 # width for right panel elements
+        # Log Area
+        log_label = QLabel("Log Hoạt Động:", central_widget); log_label.setGeometry(rx, 10, 150, 20)
+        self.log_text_edit = QTextEdit(central_widget); self.log_text_edit.setGeometry(rx, 35, lw, 250); self.log_text_edit.setReadOnly(True); self.log_text_edit.setStyleSheet("border:1px solid black; padding:5px; background-color:white; font-family:Consolas,monospace; font-size:10pt;")
+        # Status Labels
+        self.process_label = QLabel("Trạng thái: Chờ", central_widget); self.process_label.setGeometry(rx, 300, lw, 40); self.process_label.setAlignment(Qt.AlignCenter); self.process_label.setStyleSheet("border:1px solid black; padding:5px; background-color:lightgray; font-weight:bold; border-radius:3px;")
+        self.details_label = QLabel("Details: N/A", central_widget); self.details_label.setGeometry(rx, 345, lw, 30); self.details_label.setAlignment(Qt.AlignCenter); self.details_label.setStyleSheet("padding:5px; background-color:#f0f0f0; border-radius:3px;")
+
+        # Vị trí các control cấu hình
+        sx_lbl = rx + 10      # X-pos for labels in settings
+        sx_ctrl = sx_lbl + 150 # X-pos for controls (spinbox, combobox)
+        sy = 390              # Y-start pos for settings section
+        s_vs = 38             # Vertical spacing for settings rows
+        ctrl_w = 190          # Width for spinbox/combobox
+        btn_w_sm = 40         # Width for small buttons (like refresh)
+        lbl_w = 140           # Width for labels
+
+        # --- Method Selection ---
+        lm = QLabel("Phương thức:", central_widget); lm.setGeometry(sx_lbl, sy, lbl_w, 31)
+        self.comparisonMethodComboBox = QComboBox(central_widget); self.comparisonMethodComboBox.setGeometry(sx_ctrl, sy, ctrl_w + 50, 31) # Make wider
+        self.comparisonMethodComboBox.addItems([METHOD_SSIM, METHOD_YOLO])
+        self.comparisonMethodComboBox.setToolTip("Chọn thuật toán so sánh ảnh")
+        self.comparisonMethodComboBox.currentTextChanged.connect(self._update_comparison_method_config); sy += s_vs
+
+        # --- SSIM Specific Group ---
+        self.ssimGroup = QGroupBox("Cấu hình SSIM", central_widget)
+        self.ssimGroup.setGeometry(rx, sy, lw, s_vs + 10)
+        self.ssimThresholdLabel = QLabel("Ngưỡng SSIM:", self.ssimGroup); self.ssimThresholdLabel.setGeometry(10, 10, lbl_w - 10, 31)
+        self.ssimThresholdSpinBox = QDoubleSpinBox(self.ssimGroup); self.ssimThresholdSpinBox.setGeometry(sx_ctrl - rx, 10, ctrl_w, 31)
+        self.ssimThresholdSpinBox.setRange(0.1, 1.0); self.ssimThresholdSpinBox.setSingleStep(0.01); self.ssimThresholdSpinBox.setDecimals(3)
+        self.ssimThresholdSpinBox.valueChanged.connect(self._update_threshold_config); sy += s_vs + 15 # Move Y below this group
+
+        # --- YOLOv8 Specific Group ---
+        self.yoloGroup = QGroupBox("Cấu hình YOLOv8", central_widget)
+        self.yoloGroup.setGeometry(rx, sy, lw, s_vs * 2 + 15) # Taller group
+        # Model Path Row
+        lyp = QLabel("Model Path:", self.yoloGroup); lyp.setGeometry(10, 10, lbl_w - 10, 31)
+        self.yoloModelPathButton = QPushButton("📁 Chọn Model (.pt)", self.yoloGroup); self.yoloModelPathButton.setGeometry(sx_ctrl - rx, 10, ctrl_w, 31); self.yoloModelPathButton.clicked.connect(self._select_yolo_model_path)
+        self.yoloModelPathLabel = QLabel("Chưa chọn model", self.yoloGroup); self.yoloModelPathLabel.setGeometry(sx_ctrl - rx + ctrl_w + 5, 10, lw - (sx_ctrl - rx + ctrl_w + 5) - 10, 31); self.yoloModelPathLabel.setStyleSheet("font-style: italic; color: gray;")
+        # Confidence Row
+        self.yoloConfidenceLabel = QLabel("Ngưỡng Conf:", self.yoloGroup); self.yoloConfidenceLabel.setGeometry(10, 10 + s_vs, lbl_w - 10, 31)
+        self.yoloConfidenceSpinBox = QDoubleSpinBox(self.yoloGroup); self.yoloConfidenceSpinBox.setGeometry(sx_ctrl - rx, 10 + s_vs, ctrl_w, 31)
+        self.yoloConfidenceSpinBox.setRange(0.05, 1.0); self.yoloConfidenceSpinBox.setSingleStep(0.05); self.yoloConfidenceSpinBox.setDecimals(2)
+        self.yoloConfidenceSpinBox.setToolTip("Ngưỡng tin cậy tối thiểu cho YOLO detection")
+        self.yoloConfidenceSpinBox.valueChanged.connect(self._update_yolo_confidence_config); sy += s_vs * 2 + 20 # Move Y below this group
+
+        # --- Common Settings ---
+        lc = QLabel("Cooldown Lỗi (s):", central_widget); lc.setGeometry(sx_lbl, sy, lbl_w, 31)
+        self.cooldownSpinBox = QSpinBox(central_widget); self.cooldownSpinBox.setGeometry(sx_ctrl, sy, ctrl_w, 31); self.cooldownSpinBox.setRange(1, 300); self.cooldownSpinBox.setSingleStep(1); self.cooldownSpinBox.valueChanged.connect(self._update_cooldown_config); sy += s_vs
+        lr = QLabel("Thời gian chạy (phút):", central_widget); lr.setGeometry(sx_lbl, sy, lbl_w, 31)
+        self.runtimeSpinBox = QSpinBox(central_widget); self.runtimeSpinBox.setGeometry(sx_ctrl, sy, ctrl_w, 31); self.runtimeSpinBox.setRange(0, 1440); self.runtimeSpinBox.setSingleStep(10); self.runtimeSpinBox.setToolTip("0 = Chạy vô hạn"); self.runtimeSpinBox.valueChanged.connect(self._update_runtime_config); sy += s_vs
+        self.ToggleRecordOnErrorButton = self.create_button("🎥 Quay video lỗi: Tắt"); self.ToggleRecordOnErrorButton.setGeometry(sx_lbl, sy, ctrl_w + 50, 31); self.ToggleRecordOnErrorButton.clicked.connect(self._toggle_record_on_error); sy += s_vs
+
+        # --- Serial Port Settings Group ---
+        self.serialGroup = QGroupBox("Cấu hình Serial COM", central_widget)
+        self.serialGroup.setGeometry(rx, sy, lw, s_vs * 3 + 15) # Adjust height
+        sy_serial = 10 # Y inside this groupbox
+        # COM Port Row
+        lcp = QLabel("Cổng COM:", self.serialGroup); lcp.setGeometry(10, sy_serial, lbl_w - 10, 31)
+        self.comPortComboBox = QComboBox(self.serialGroup); self.comPortComboBox.setGeometry(sx_ctrl - rx, sy_serial, ctrl_w - btn_w_sm - 5, 31); self.comPortComboBox.currentTextChanged.connect(self._update_serial_port_config)
+        self.refreshComButton = QPushButton("🔄", self.serialGroup); self.refreshComButton.setGeometry(sx_ctrl - rx + ctrl_w - btn_w_sm, sy_serial, btn_w_sm, 31); self.refreshComButton.clicked.connect(self._refresh_com_ports); sy_serial += s_vs
+        # Baud Rate Row
+        lbr = QLabel("Baud Rate:", self.serialGroup); lbr.setGeometry(10, sy_serial, lbl_w - 10, 31)
+        self.baudRateComboBox = QComboBox(self.serialGroup); self.baudRateComboBox.setGeometry(sx_ctrl - rx, sy_serial, ctrl_w, 31); self.baudRateComboBox.addItems([str(br) for br in COMMON_BAUD_RATES]); self.baudRateComboBox.currentTextChanged.connect(self._update_serial_baud_config); sy_serial += s_vs
+        # Toggle Connect/Disconnect Button
+        self.ToggleSerialPortButton = self.create_button("🔌 Kết nối COM"); self.ToggleSerialPortButton.setGeometry(10, sy_serial, ctrl_w + 50, 31); self.ToggleSerialPortButton.clicked.connect(self._toggle_serial_port)
+        # sy += s_vs * 3 + 20 # Final Y position update if needed after this group
+
+        # Initial UI state update after widgets are created
+        self._update_method_specific_ui() # Hide/show SSIM/YOLO groups
+
+    def create_button(self, text):
+        """Hàm trợ giúp tạo QPushButton với style chuẩn."""
+        button = QPushButton(text, self.centralWidget())
+        # Tùy chỉnh style thêm nếu cần
+        return button
+
+    # --- Config Save/Load/Reset ---
+    def save_config(self):
+        """Lưu cấu hình hiện tại vào file JSON."""
+        self.config['comparison_method'] = self.current_comparison_method
+        self.config['ssim_threshold'] = self._current_ssim_threshold
+        self.config['error_cooldown'] = self._current_error_cooldown
+        self.config['runtime_duration_minutes'] = self._current_runtime_minutes
+        self.config['record_on_error'] = self._record_on_error_enabled
+        self.config['error_folder'] = self.error_folder
+        self.config['webcam_roi'] = list(self.webcam_roi) if self.webcam_roi else None
+        # Lấy giá trị YOLO conf từ UI
+        self.config['yolo_confidence'] = self.yoloConfidenceSpinBox.value()
+        # yolo_model_path đã được cập nhật trong _select_yolo_model_path
+
+        # Chỉ lưu đường dẫn ảnh SSIM nếu ảnh thực sự tồn tại và được load từ file
+        valid_ref_paths = {}
+        for k, img in self.ref_data.items():
+            path_in_config = self.config['ref_paths'].get(k)
+            if isinstance(img, np.ndarray) and img.size > 0 and isinstance(path_in_config, str) and os.path.isfile(path_in_config):
+                valid_ref_paths[k] = path_in_config
+        self.config['ref_paths'] = valid_ref_paths
+
+        self.config['serial_port'] = self.serial_port_name
+        self.config['serial_baud'] = self.serial_baud_rate
+        # Lưu trạng thái cuối nhưng không tự kết nối lại khi tải
+        self.config['serial_enabled'] = self.serial_enabled
+
+        try:
+            # Tạo thư mục nếu chưa có
+            config_dir = os.path.dirname(CONFIG_FILE_NAME)
+            if config_dir and not os.path.exists(config_dir):
+                os.makedirs(config_dir, exist_ok=True)
+            # Ghi file JSON
+            with open(CONFIG_FILE_NAME, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self.log_activity(f"❌ Lỗi khi lưu cấu hình: {e}")
+            QMessageBox.critical(self, "Lỗi Lưu Config", f"Không thể lưu cấu hình vào file:\n{CONFIG_FILE_NAME}\n\nLỗi: {e}")
+
+    def load_config(self):
+        """Tải cấu hình từ file JSON, xử lý lỗi và giá trị mặc định."""
+        if not os.path.exists(CONFIG_FILE_NAME):
+            self.log_activity(f"📄 Không tìm thấy file config '{CONFIG_FILE_NAME}'. Sử dụng mặc định.")
+            self.reset_to_defaults()
+            return # Thoát khỏi hàm sau khi reset
+
+        try:
+            with open(CONFIG_FILE_NAME, 'r', encoding='utf-8') as f:
+                lcfg = json.load(f) # Loaded config from file
+
+            # 1. Tải phương thức so sánh
+            loaded_method = lcfg.get('comparison_method', DEFAULT_COMPARISON_METHOD)
+            if loaded_method in self.comparison_functions:
+                # Kiểm tra đặc biệt nếu chọn YOLO mà thư viện chưa cài
+                if loaded_method == METHOD_YOLO and not YOLO_AVAILABLE:
+                    self.log_activity(f"⚠️ YOLO được chọn nhưng chưa cài đặt. Đổi về {DEFAULT_COMPARISON_METHOD}.")
+                    self.current_comparison_method = DEFAULT_COMPARISON_METHOD
+                else:
+                    self.current_comparison_method = loaded_method
+            else: # Phương thức trong file config không hợp lệ
+                self.log_activity(f"⚠️ Phương thức '{loaded_method}' không hợp lệ. Dùng mặc định.")
+                self.current_comparison_method = DEFAULT_COMPARISON_METHOD
+
+            # 2. Tải các cấu hình khác với validation và giá trị mặc định
+            try: self._current_ssim_threshold = max(0.1, min(1.0, float(lcfg.get('ssim_threshold', DEFAULT_SSIM_THRESHOLD))))
+            except (ValueError, TypeError): self._current_ssim_threshold = DEFAULT_SSIM_THRESHOLD
+            try: self._current_error_cooldown = max(1, min(300, int(lcfg.get('error_cooldown', DEFAULT_ERROR_COOLDOWN))))
+            except (ValueError, TypeError): self._current_error_cooldown = DEFAULT_ERROR_COOLDOWN
+            try: self._current_runtime_minutes = max(0, min(1440, int(lcfg.get('runtime_duration_minutes', DEFAULT_RUNTIME_MINUTES))))
+            except (ValueError, TypeError): self._current_runtime_minutes = DEFAULT_RUNTIME_MINUTES
+            lrec = lcfg.get('record_on_error', DEFAULT_RECORD_ON_ERROR)
+            self._record_on_error_enabled = bool(lrec) if isinstance(lrec, bool) else DEFAULT_RECORD_ON_ERROR
+
+            # 3. Tải cấu hình Serial (Luôn đặt enabled=False khi tải)
+            self.serial_port_name = lcfg.get('serial_port', None)
+            if not isinstance(self.serial_port_name, (str, type(None))): self.serial_port_name = None # Validate type
+            try:
+                baud = int(lcfg.get('serial_baud', DEFAULT_BAUD_RATE))
+                self.serial_baud_rate = baud if baud in COMMON_BAUD_RATES else DEFAULT_BAUD_RATE
+            except (ValueError, TypeError): self.serial_baud_rate = DEFAULT_BAUD_RATE
+            self.serial_enabled = False # Bắt buộc kết nối lại thủ công
+
+            # 4. Tải Thư mục lỗi và ROI (với kiểm tra)
+            lfold = lcfg.get('error_folder'); self.error_folder = None
+            if lfold and isinstance(lfold, str) and os.path.isdir(lfold) and os.access(lfold, os.W_OK):
+                self.error_folder = lfold
+            else:
+                 if lfold: self.log_activity(f"⚠️ Thư mục lỗi '{lfold}' không hợp lệ hoặc không ghi được.")
+
+            lroi = lcfg.get('webcam_roi'); self.webcam_roi = None
+            if isinstance(lroi, list) and len(lroi) == 4:
+                 try:
+                     rt = tuple(int(x) for x in lroi)
+                     if all(v >= 0 for v in rt) and rt[2] > 0 and rt[3] > 0: self.webcam_roi = rt
+                 except (ValueError, TypeError): pass # Bỏ qua ROI không hợp lệ
+
+            # 5. Tải đường dẫn ảnh SSIM và load ảnh
+            lrefs = lcfg.get('ref_paths', {})
+            self.config['ref_paths'] = {k: None for k in self.ref_data.keys()} # Reset trong config
+            self.ref_data = {k: None for k in self.ref_data.keys()} # Reset ảnh đã tải
+            loaded_image_keys = []
+            # ---- SỬA LỖI CÚ PHÁP TẠI ĐÂY ----
+            for k in self.ref_data.keys():
+                p = lrefs.get(k)
+                if p and isinstance(p, str) and os.path.isfile(p):
+                    try:
+                        # Sử dụng np.fromfile và cv2.imdecode để xử lý đường dẫn unicode
+                        img_bytes = np.fromfile(p, dtype=np.uint8)
+                        img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            self.ref_data[k] = img           # Thụt lề đúng, bỏ dấu ;
+                            self.config['ref_paths'][k] = p  # Thụt lề đúng, bỏ dấu ;
+                            loaded_image_keys.append(k)    # Thụt lề đúng, bỏ dấu ;
+                        # else: Không cần báo lỗi nếu decode thất bại, coi như file hỏng
+                    except Exception as e:
+                        # Ghi log nếu có lỗi khác khi đọc file
+                        self.log_activity(f"⚠️ Lỗi khi tải ảnh SSIM '{k}' từ '{p}': {e}")
+            # ---------------------------------
+            if loaded_image_keys: self.log_activity(f"✅ Tải ảnh SSIM: {', '.join(loaded_image_keys)}")
+
+            # 6. Tải cấu hình YOLO
+            self.config['yolo_model_path'] = lcfg.get('yolo_model_path', None)
+            if self.config['yolo_model_path'] and not isinstance(self.config['yolo_model_path'], str):
+                 self.config['yolo_model_path'] = None # Đảm bảo là string hoặc None
+            try:
+                yolo_conf = float(lcfg.get('yolo_confidence', DEFAULT_YOLO_CONFIDENCE))
+                # Đảm bảo giá trị trong khoảng hợp lệ
+                self.config['yolo_confidence'] = max(0.01, min(1.0, yolo_conf))
+            except (ValueError, TypeError):
+                self.config['yolo_confidence'] = DEFAULT_YOLO_CONFIDENCE
+
+            # 7. Cập nhật dict config cuối cùng sau khi tải
+            # (Các giá trị đã được cập nhật vào self.config hoặc các biến state trong các bước trên)
+            # Chỉ cần đảm bảo self.config phản ánh đúng trạng thái cuối cùng
+            # Ví dụ: Cập nhật lại những gì chưa được gán trực tiếp vào self.config
+            self.config.update({
+                'comparison_method': self.current_comparison_method,
+                'ssim_threshold': self._current_ssim_threshold,
+                'error_cooldown': self._current_error_cooldown,
+                'runtime_duration_minutes': self._current_runtime_minutes,
+                'record_on_error': self._record_on_error_enabled,
+                'error_folder': self.error_folder,
+                'webcam_roi': list(self.webcam_roi) if self.webcam_roi else None,
+                'serial_port': self.serial_port_name,
+                'serial_baud': self.serial_baud_rate,
+                'serial_enabled': self.serial_enabled, # Sẽ là False
+                # ref_paths, yolo_model_path, yolo_confidence đã cập nhật
+            })
+
+            # 8. Cập nhật đường dẫn file log
+            self.log_file_path = os.path.join(self.error_folder, LOG_FILE_NAME) if self.error_folder else None
+            self.log_activity(f"💾 Đã tải cấu hình từ '{CONFIG_FILE_NAME}'.")
+
+        except json.JSONDecodeError as e:
+             # Lỗi khi phân tích file JSON
+             self.log_activity(f"❌ Lỗi JSON trong file config: {e}. Sử dụng mặc định.")
+             self.reset_to_defaults()
+        # ---- SỬA LỖI CÚ PHÁP TẠI ĐÂY ----
+        except Exception as e:
+             # Bắt tất cả các lỗi khác có thể xảy ra khi tải config
+             self.log_activity(f"❌ Lỗi nghiêm trọng khi tải config: {e}. Sử dụng mặc định.")
+             self.log_activity(traceback.format_exc())
+             self.reset_to_defaults() # Thụt lề đúng cho hàm này
+        # ---------------------------------
+
+    # --- Các hàm còn lại giữ nguyên hoặc chỉ sửa nhỏ ---
+    # (reset_to_defaults, update_all_ui_elements, _update_method_specific_ui,
+    #  log_activity, update_status_label, update_details_display, _call_lambda_slot,
+    #  _set_button_style, update_button_styles, update_toggle_button_text,
+    #  update_record_button_style, update_serial_button_style, start_webcam,
+    #  update_frame, stop_webcam, load_reference_image, capture_reference_from_webcam,
+    #  select_webcam_roi, select_error_folder, _refresh_com_ports, _toggle_serial_port,
+    #  _send_serial_command, _select_yolo_model_path, _load_yolo_model,
+    #  toggle_processing, _mark_error_occurred, disable_settings_while_processing,
+    #  _runtime_timer_timeout, compare_ssim_strategy, compare_yolo_strategy,
+    #  _check_yolo_rule, save_error_image_from_thread, close_application, closeEvent)
+    def reset_to_defaults(self):
+        self.log_activity("🔄 Reset về mặc định...")
+        self.current_comparison_method = DEFAULT_COMPARISON_METHOD
+        self._current_ssim_threshold=DEFAULT_SSIM_THRESHOLD
+        self._current_error_cooldown=DEFAULT_ERROR_COOLDOWN
+        self._current_runtime_minutes=DEFAULT_RUNTIME_MINUTES
+        self._record_on_error_enabled=DEFAULT_RECORD_ON_ERROR
+        self.error_folder=None; self.log_file_path=None; self.webcam_roi=None
+        self.ref_data={k:None for k in[REF_NORM,REF_SHUTDOWN,REF_FAIL]}
+        # Giải phóng model YOLO nếu đang có
+        if self.yolo_model is not None: del self.yolo_model; self.yolo_model = None
+
+        # Reset Serial
+        self.serial_port_name=None; self.serial_baud_rate=DEFAULT_BAUD_RATE; self.serial_enabled=False
+        if self.serial_port and self.serial_port.is_open:
+            try: self.serial_port.close()
+            except Exception: pass # Bỏ qua lỗi khi đóng ở đây
+        self.serial_port=None
+
+        # Reset Config Dictionary về mặc định
+        self.config={
+            'comparison_method': DEFAULT_COMPARISON_METHOD,
+            'ssim_threshold': DEFAULT_SSIM_THRESHOLD,
+            'error_cooldown': DEFAULT_ERROR_COOLDOWN,
+            'runtime_duration_minutes': DEFAULT_RUNTIME_MINUTES,
+            'record_on_error': DEFAULT_RECORD_ON_ERROR,
+            'error_folder': None,
+            'ref_paths': {k:None for k in [REF_NORM, REF_SHUTDOWN, REF_FAIL]},
+            'webcam_roi': None,
+            'serial_port': None,
+            'serial_baud': DEFAULT_BAUD_RATE,
+            'serial_enabled': False,
+            'yolo_model_path': None,
+            'yolo_confidence': DEFAULT_YOLO_CONFIDENCE,
+        }
+        # Cập nhật lại giao diện sau khi reset
+        # Sử dụng hasattr để kiểm tra xem UI đã được khởi tạo chưa (phòng trường hợp lỗi sớm)
+        if hasattr(self, 'comparisonMethodComboBox'):
+            self.update_all_ui_elements()
+        self.save_config() # Lưu lại file config với giá trị mặc định mới
+        self.log_activity("🔄 Hoàn tất reset về mặc định.")
+
+
+    def update_all_ui_elements(self):
+        """Cập nhật tất cả các control trên UI để phản ánh trạng thái/config hiện tại."""
+        self.log_activity("ℹ️ Cập nhật giao diện người dùng...")
+        # Danh sách các control cần chặn tín hiệu khi cập nhật giá trị
+        controls_to_block = [
+            self.comparisonMethodComboBox, self.ssimThresholdSpinBox, self.yoloConfidenceSpinBox,
+            self.cooldownSpinBox, self.runtimeSpinBox, self.comPortComboBox, self.baudRateComboBox
+        ]
+        # Chặn tín hiệu
+        for control in controls_to_block: control.blockSignals(True)
+
+        # Cập nhật giá trị cho từng control từ self.config hoặc biến trạng thái
+        try:
+            self.comparisonMethodComboBox.setCurrentText(self.current_comparison_method)
+            self.ssimThresholdSpinBox.setValue(self._current_ssim_threshold)
+            self.yoloConfidenceSpinBox.setValue(self.config.get('yolo_confidence', DEFAULT_YOLO_CONFIDENCE))
+            self.cooldownSpinBox.setValue(self._current_error_cooldown)
+            self.runtimeSpinBox.setValue(self._current_runtime_minutes)
+            self.baudRateComboBox.setCurrentText(str(self.serial_baud_rate))
+
+            # Cập nhật ComboBox cổng COM (logic phức tạp hơn)
+            com_index = self.comPortComboBox.findText(self.serial_port_name if self.serial_port_name else "")
+            if self.serial_port_name and com_index >= 0:
+                self.comPortComboBox.setCurrentIndex(com_index)
+            elif self.comPortComboBox.count() > 0 and "Không tìm thấy" not in self.comPortComboBox.itemText(0):
+                # Nếu cổng đã lưu không có, nhưng có cổng khác, chọn cổng đầu tiên
+                self.comPortComboBox.setCurrentIndex(0)
+                # Cập nhật lại serial_port_name nếu cần thiết (tùy chọn)
+                # self.serial_port_name = self.comPortComboBox.currentText()
+                # self.config['serial_port'] = self.serial_port_name
+            # else: Không có cổng nào, không cần làm gì thêm
+
+            # Cập nhật label đường dẫn model YOLO
+            model_path = self.config.get('yolo_model_path')
+            if model_path and isinstance(model_path, str):
+                self.yoloModelPathLabel.setText(os.path.basename(model_path))
+                self.yoloModelPathLabel.setStyleSheet("font-style: normal; color: black;")
+                self.yoloModelPathLabel.setToolTip(model_path)
+            else:
+                self.yoloModelPathLabel.setText("Chưa chọn model")
+                self.yoloModelPathLabel.setStyleSheet("font-style: italic; color: gray;")
+                self.yoloModelPathLabel.setToolTip("")
+
+        except Exception as ui_update_err:
+            self.log_activity(f"❌ Lỗi khi cập nhật giá trị UI: {ui_update_err}")
+        finally:
+            # Bỏ chặn tín hiệu (luôn thực hiện)
+            for control in controls_to_block: control.blockSignals(False)
+
+        # Cập nhật style nút và hiển thị/ẩn các group
+        self.update_button_styles()
+        self.update_toggle_button_text()
+        self.update_record_button_style()
+        self.update_serial_button_style()
+        self._update_method_specific_ui()
+        # Bật/tắt control dựa trên trạng thái processing
+        self.disable_settings_while_processing(self.processing)
+        self.log_activity("ℹ️ Cập nhật giao diện hoàn tất.")
+
+
+    def _update_method_specific_ui(self):
+        """Hiển thị/ẩn các group cấu hình SSIM/YOLO."""
+        is_ssim = (self.current_comparison_method == METHOD_SSIM)
+        is_yolo = (self.current_comparison_method == METHOD_YOLO)
+        # Sử dụng hasattr để phòng trường hợp UI chưa kịp tạo đầy đủ
+        if hasattr(self, 'ssimGroup'): self.ssimGroup.setVisible(is_ssim)
+        if hasattr(self, 'yoloGroup'): self.yoloGroup.setVisible(is_yolo)
+        # Cập nhật lại tooltip/text của các nút liên quan nếu cần
+        self.update_button_styles()
+
+
+    # --- log_activity giữ nguyên ---
+    @QtCore.pyqtSlot(str)
+    def log_activity(self, message):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        full_message = f"{timestamp} - {message}"
+        if hasattr(self, 'log_text_edit'):
+            # Đảm bảo thread-safe nếu cần (dùng tín hiệu từ worker là chính)
+            if QtCore.QThread.currentThread() != self.log_text_edit.thread():
+                QtCore.QMetaObject.invokeMethod(self.log_text_edit, "append", Qt.QueuedConnection, QtCore.Q_ARG(str, full_message))
+                QtCore.QMetaObject.invokeMethod(self.log_text_edit, "ensureCursorVisible", Qt.QueuedConnection)
+            else:
+                self.log_text_edit.append(full_message)
+                self.log_text_edit.ensureCursorVisible()
+        # Ghi vào file log
+        if self.log_file_path:
+            try:
+                log_dir = os.path.dirname(self.log_file_path)
+                if log_dir and not os.path.exists(log_dir):
+                     os.makedirs(log_dir, exist_ok=True)
+                # Mở file để ghi thêm (append)
+                with open(self.log_file_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(full_message + "\n")
+            except Exception as e:
+                # Lỗi nghiêm trọng khi ghi log, thông báo và vô hiệu hóa ghi file
+                print(f"CRITICAL: Lỗi ghi file log '{self.log_file_path}': {e}. Vô hiệu hóa ghi log.")
+                self.log_file_path = None
+
+
+    # --- update_status_label, update_details_display, _call_lambda_slot giữ nguyên ---
+    @QtCore.pyqtSlot(ComparisonStatus, object)
+    def update_status_label(self, status_enum, details_dict):
+        status_info = STATUS_MAP.get(status_enum, STATUS_MAP[ComparisonStatus.ERROR])
+        message = status_info["label"]
+        background_color = status_info["color"]
+        _update = lambda: (
+            self.process_label.setText(f"Trạng thái: {message}"),
+            self.process_label.setStyleSheet(f"border:1px solid black; padding:5px; background-color:{background_color}; color:black; font-weight:bold; border-radius:3px;")
+        )
+        if self.process_label.thread() != QtCore.QThread.currentThread():
+             QtCore.QMetaObject.invokeMethod(self, "_call_lambda_slot", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(object, _update))
+        else: _update()
+
+    @QtCore.pyqtSlot(dict)
+    def update_details_display(self, details):
+         display_text = "Details: N/A"
+         if details:
+             if 'detected' in details:
+                 det_items = sorted([f"{k}:{v}" for k,v in details['detected'].items()])
+                 display_text = f"Detect: {', '.join(det_items) if det_items else 'None'}"
+                 if 'count' in details: display_text += f" (Total: {details['count']})"
+             elif 'ssim_norm' in details:
+                 display_text = f"SSIM(N): {details['ssim_norm']:.4f}"
+                 if 'ssim_shutdown' in details: display_text += f", SSIM(S): {details['ssim_shutdown']:.4f}"
+                 if 'ssim_fail' in details: display_text += f", SSIM(F): {details['ssim_fail']:.4f}"
+             elif 'error' in details:
+                 display_text = f"Error: {details['error']}"
+
+             if 'reason' in details: display_text += f" [{details['reason']}]"
+
+         _update = lambda: self.details_label.setText(display_text)
+         if self.details_label.thread() != QtCore.QThread.currentThread():
+             QtCore.QMetaObject.invokeMethod(self, "_call_lambda_slot", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(object, _update))
+         else: _update()
+
+    @QtCore.pyqtSlot(object)
+    def _call_lambda_slot(self, f): f()
+
+
+    # --- Các hàm cập nhật style nút (_set_button_style, update_button_styles, etc.) giữ nguyên ---
+    def _set_button_style(self, button, base_text, icon, state_text="", background_color="white", text_color="black"):
+        full_text=f"{icon} {base_text}"+ (f" ({state_text})" if state_text else "")
+        button.setText(full_text)
+        style=f"""
+            QPushButton {{
+                background-color: {background_color}; color: {text_color};
+                border: 1px solid #ccc; border-radius: 3px; padding: 6px;
+                text-align: center;
+            }}
+            QPushButton:hover {{ background-color: #e8f0fe; }}
+            QPushButton:pressed {{ background-color: #d0e0f8; }}
+            QPushButton:disabled {{
+                background-color: #f0f0f0; color: #a0a0a0; border-color: #d0d0d0;
+            }} """
+        button.setStyleSheet(style)
+
+    def update_button_styles(self):
+        is_ssim = self.current_comparison_method == METHOD_SSIM
+        button_map = {
+            REF_NORM: (self.SettingButton_Norm, self.CaptureButton_Norm, "Ảnh Norm", "Chụp Norm"),
+            REF_SHUTDOWN: (self.SettingButton_Shutdown, self.CaptureButton_Shut, "Ảnh Shutdown", "Chụp Shutdown"),
+            REF_FAIL: (self.SettingButton_Fail, self.CaptureButton_Fail, "Ảnh Fail", "Chụp Fail"),
+        }
+        icon_load="📂"; icon_capture="📸"
+
+        for key, (load_btn, cap_btn, load_txt, cap_txt) in button_map.items():
+            has_image = isinstance(self.ref_data.get(key), np.ndarray) and self.ref_data[key].size > 0
+            is_from_file = has_image and isinstance(self.config['ref_paths'].get(key), str)
+            hint = "" if is_ssim else "(SSIM)"
+            # Đặt tooltip rõ ràng hơn
+            ssim_tooltip = "Chỉ dùng cho phương thức SSIM"
+            load_tooltip = ssim_tooltip if not is_ssim else f"Tải ảnh tham chiếu {key} từ file (cho SSIM)"
+            cap_tooltip = ssim_tooltip if not is_ssim else f"Chụp ảnh tham chiếu {key} từ webcam (cho SSIM)"
+            load_btn.setToolTip(load_tooltip)
+            cap_btn.setToolTip(cap_tooltip)
+
+            # Đặt style và màu nền
+            if has_image:
+                if is_from_file: # Ảnh từ file
+                    self._set_button_style(load_btn, f"{load_txt} {hint}", icon_load, "File", "lightgreen" if is_ssim else "lightgray")
+                    self._set_button_style(cap_btn, f"{cap_txt} {hint}", icon_capture)
+                else: # Ảnh từ webcam
+                    self._set_button_style(load_btn, f"{load_txt} {hint}", icon_load)
+                    self._set_button_style(cap_btn, f"{cap_txt} {hint}", icon_capture, "Webcam", "lightblue" if is_ssim else "lightgray")
+            else: # Chưa có ảnh
+                 self._set_button_style(load_btn, f"{load_txt} {hint}", icon_load)
+                 self._set_button_style(cap_btn, f"{cap_txt} {hint}", icon_capture)
+
+        # Nút ROI và Thư mục lỗi
+        if self.webcam_roi: self._set_button_style(self.SettingButton_ROI_Webcam,"Chọn ROI","✂️","Đã chọn","lightblue")
+        else: self._set_button_style(self.SettingButton_ROI_Webcam,"Chọn ROI","✂️")
+        if self.error_folder: self._set_button_style(self.SaveButton,"Thư mục lỗi","📁","Đã chọn","lightblue")
+        else: self._set_button_style(self.SaveButton,"Thư mục lỗi","📁")
+
+    def update_toggle_button_text(self):
+        if self.processing: self._set_button_style(self.ToggleProcessingButton,"Dừng Xử lý","⏹", background_color="orange")
+        else: self._set_button_style(self.ToggleProcessingButton,"Bắt đầu","▶️", background_color="lightgreen")
+
+    def update_record_button_style(self):
+        if self._record_on_error_enabled: self._set_button_style(self.ToggleRecordOnErrorButton,"Quay video lỗi","🎥","Bật","lightcoral")
+        else: self._set_button_style(self.ToggleRecordOnErrorButton,"Quay video lỗi","🎥","Tắt","lightgray")
+
+    def update_serial_button_style(self):
+        if self.serial_enabled:
+            self._set_button_style(self.ToggleSerialPortButton,"Ngắt kết nối COM","🔌","Đang kết nối","lightcoral")
+        else:
+            has_ports = hasattr(self,'comPortComboBox') and self.comPortComboBox.count() > 0 and "Không tìm thấy" not in self.comPortComboBox.itemText(0)
+            if has_ports: self._set_button_style(self.ToggleSerialPortButton,"Kết nối COM","🔌","Chưa kết nối","lightgreen")
+            else: self._set_button_style(self.ToggleSerialPortButton,"Kết nối COM","🔌","Không có cổng","lightgray")
+
+    # --- start_webcam, update_frame, stop_webcam giữ nguyên ---
+    def start_webcam(self):
+        if self.cap is not None and self.cap.isOpened():
+            self.log_activity("⚠️ Webcam đã được bật.")
+            return
+        try:
+            # Thử các backend phổ biến trên Windows trước
+            preferred_backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, None] # None = thử backend mặc định
+            self.cap = None
+            opened_backend = "N/A"
+
+            for backend_flag in preferred_backends:
+                api_preference = backend_flag if backend_flag is not None else cv2.CAP_ANY
+                try:
+                    temp_cap = cv2.VideoCapture(0, api_preference) # Index 0 là webcam mặc định
+                    if temp_cap and temp_cap.isOpened():
+                        # Thử đọc một frame để xác nhận webcam hoạt động
+                        ret_test, _ = temp_cap.read()
+                        if ret_test:
+                            self.cap = temp_cap # Mở thành công
+                            opened_backend = self.cap.getBackendName()
+                            break # Thoát vòng lặp khi tìm được backend hoạt động
+                        else:
+                            temp_cap.release() # Backend mở được nhưng không đọc được frame
+                            self.log_activity(f"ℹ️ Webcam backend {api_preference} không đọc được frame.")
+                    elif temp_cap: # temp_cap tồn tại nhưng isOpened() là false
+                        temp_cap.release()
+                except Exception as cam_err:
+                    # Ghi log lỗi khi thử backend cụ thể
+                    self.log_activity(f"ℹ️ Lỗi thử webcam backend {api_preference}: {cam_err}")
+                    if temp_cap: temp_cap.release()
+
+            # Kiểm tra sau khi thử tất cả các backend
+            if self.cap is None or not self.cap.isOpened():
+                 raise IOError("Không thể mở webcam hoặc đọc frame ban đầu.")
+
+            # Đã mở webcam thành công
+            # Lấy thông tin webcam
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # Cố gắng đặt FPS mong muốn (không phải lúc nào cũng thành công)
+            requested_fps = 15.0
+            self.cap.set(cv2.CAP_PROP_FPS, requested_fps)
+            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            # Nếu không lấy được FPS hoặc FPS=0, dùng giá trị mặc định
+            if actual_fps <= 0: actual_fps = requested_fps
+            self.webcam_fps = actual_fps
+            # Tính khoảng thời gian timer dựa trên FPS (ms), tối thiểu 33ms (~30fps)
+            timer_interval = max(33, int(1000 / self.webcam_fps))
+
+            self.log_activity(f"🚀 Webcam đã bật (Backend: {opened_backend}, Res: {w}x{h}, FPS: {self.webcam_fps:.1f}, Interval: {timer_interval}ms)")
+
+            # Bắt đầu timer đọc frame
+            self.frame_timer.start(timer_interval)
+            # Cập nhật trạng thái nút
+            self.ONCam.setEnabled(False); self.OFFCam.setEnabled(True)
+            # Đặt nền đen cho khu vực hiển thị video
+            self.graphicsView.setBackgroundBrush(QtGui.QBrush(Qt.black))
+
+            # Kích hoạt các nút liên quan (Chụp ảnh, ROI) nếu không đang xử lý
+            if not self.processing:
+                self.SettingButton_ROI_Webcam.setEnabled(True)
+                # Chỉ bật nút chụp nếu phương thức là SSIM (hoặc luôn bật nếu muốn?)
+                is_ssim_mode = self.current_comparison_method == METHOD_SSIM
+                for btn in [self.CaptureButton_Norm, self.CaptureButton_Shut, self.CaptureButton_Fail]:
+                     btn.setEnabled(is_ssim_mode)
+
+        except Exception as e:
+            emsg = f"❌ Lỗi nghiêm trọng khi bật webcam: {e}"
+            self.log_activity(emsg)
+            self.log_activity(traceback.format_exc())
+            QMessageBox.critical(self, "Lỗi Webcam", f"Không thể khởi động webcam.\nChi tiết: {e}")
+            # Đảm bảo dọn dẹp nếu có lỗi
+            if self.cap: self.cap.release(); self.cap = None
+            # Reset trạng thái nút
+            self.ONCam.setEnabled(True); self.OFFCam.setEnabled(False)
+            self.SettingButton_ROI_Webcam.setEnabled(False)
+            for btn in [self.CaptureButton_Norm, self.CaptureButton_Shut, self.CaptureButton_Fail]: btn.setEnabled(False)
+            self.graphicsView.setBackgroundBrush(QtGui.QBrush(Qt.darkGray))
+
+
+    def update_frame(self):
+        """Đọc frame từ webcam, hiển thị và đưa vào queue xử lý."""
+        if self.cap is None or not self.cap.isOpened(): return # Chưa có webcam
+
+        ret, frame = self.cap.read() # Đọc frame
+        if not ret or frame is None:
+            # Log lỗi đọc frame định kỳ để tránh spam
+            current_time = time.time()
+            if not hasattr(self, 'last_read_error_time') or current_time - getattr(self, 'last_read_error_time', 0) > 5:
+                self.log_activity("⚠️ Lỗi đọc frame từ webcam.")
+                setattr(self, 'last_read_error_time', current_time)
+            return
+
+        # Xóa cờ lỗi nếu đọc thành công
+        if hasattr(self, 'last_read_error_time'): delattr(self, 'last_read_error_time')
+
+        try:
+            display_frame = frame.copy() # Frame để hiển thị (có thể vẽ ROI)
+            processing_frame = frame     # Frame để xử lý (có thể bị crop)
+
+            # 1. Áp dụng ROI nếu có
+            if self.webcam_roi:
+                x, y, w, h = self.webcam_roi
+                fh, fw = frame.shape[:2] # Kích thước frame gốc
+                # Đảm bảo ROI nằm trong khung hình
+                x1, y1 = max(0, x), max(0, y)
+                x2, y2 = min(fw, x + w), min(fh, y + h)
+                if x2 > x1 and y2 > y1: # ROI hợp lệ
+                    # Crop frame để xử lý
+                    processing_frame = frame[y1:y2, x1:x2]
+                    # Vẽ hình chữ nhật ROI lên frame hiển thị
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                else: # ROI không hợp lệ (ví dụ ngoài khung hình)
+                     processing_frame = frame # Dùng frame đầy đủ nếu ROI lỗi
+                     # Log lỗi ROI định kỳ
+                     current_time = time.time()
+                     if not hasattr(self,'last_roi_error_time') or current_time - getattr(self,'last_roi_error_time', 0) > 10:
+                         self.log_activity(f"⚠️ ROI {self.webcam_roi} không hợp lệ. Dùng frame đầy đủ.")
+                         setattr(self,'last_roi_error_time', current_time)
+            else: # Không có ROI
+                 if hasattr(self,'last_roi_error_time'): delattr(self,'last_roi_error_time')
+
+            # 2. Hiển thị frame (display_frame)
+            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            h_disp, w_disp, ch = frame_rgb.shape
+            bytes_per_line = ch * w_disp
+            qt_image = QtGui.QImage(frame_rgb.data, w_disp, h_disp, bytes_per_line, QtGui.QImage.Format_RGB888)
+
+            # Scale ảnh để vừa với QGraphicsView
+            view_w = self.graphicsView.viewport().width()
+            view_h = self.graphicsView.viewport().height()
+            pixmap = QtGui.QPixmap.fromImage(qt_image).scaled(view_w - 2, view_h - 2, # Trừ viền 1px
+                                                              Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            # Cập nhật hoặc tạo QGraphicsPixmapItem
+            if self.pixmap_item is None:
+                self.pixmap_item = QtWidgets.QGraphicsPixmapItem(pixmap)
+                self.scene.addItem(self.pixmap_item)
+                # Căn giữa lần đầu
+                self.graphicsView.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+            else:
+                self.pixmap_item.setPixmap(pixmap)
+                # Cập nhật lại view nếu kích thước thay đổi (tùy chọn)
+                # self.graphicsView.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+
+
+            # 3. Xử lý ghi video (nếu đang bật)
+            if self.processing and self._record_on_error_enabled:
+                # Khởi tạo VideoWriter nếu chưa có
+                if self.video_writer is None:
+                    if self.error_folder and os.path.isdir(self.error_folder):
+                        try:
+                            vid_h, vid_w = processing_frame.shape[:2] # Kích thước video bằng frame xử lý
+                            video_dir = os.path.join(self.error_folder, VIDEO_SUBFOLDER)
+                            os.makedirs(video_dir, exist_ok=True)
+                            timestamp = time.strftime('%Y%m%d_%H%M%S')
+                            video_filename = f"error_rec_{timestamp}.mp4" # Hoặc .avi
+                            self.current_video_path = os.path.join(video_dir, video_filename)
+
+                            # Chọn codec (mp4v cho .mp4, XVID cho .avi)
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Hoặc 'XVID'
+                            # Đảm bảo FPS hợp lệ
+                            record_fps = max(1.0, self.webcam_fps) # Ít nhất 1 FPS
+                            self.video_writer = cv2.VideoWriter(self.current_video_path, fourcc, record_fps, (vid_w, vid_h))
+
+                            if self.video_writer.isOpened():
+                                self.log_activity(f"🔴 Bắt đầu ghi video lỗi: {video_filename} ({vid_w}x{vid_h} @{record_fps:.1f}fps)")
+                                self.error_occurred_during_recording = False # Reset cờ lỗi
+                            else:
+                                self.log_activity(f"❌ Không thể tạo VideoWriter cho {video_filename}")
+                                self.video_writer = None; self.current_video_path = None
+                        except Exception as e_vid:
+                            self.log_activity(f"❌ Lỗi tạo VideoWriter: {e_vid}")
+                            self.log_activity(traceback.format_exc())
+                            self.video_writer = None; self.current_video_path = None
+                    else: # Chưa có thư mục lỗi
+                         # Log cảnh báo định kỳ
+                        current_time = time.time()
+                        if not hasattr(self,'last_vid_folder_err') or current_time - getattr(self,'last_vid_folder_err', 0) > 30:
+                            self.log_activity("⚠️ Chưa đặt thư mục lỗi hợp lệ để ghi video.")
+                            setattr(self,'last_vid_folder_err', current_time)
+
+                # Ghi frame vào video nếu đã mở
+                if self.video_writer and self.video_writer.isOpened():
+                    try:
+                        self.video_writer.write(processing_frame)
+                    except Exception as e_write:
+                        self.log_activity(f"❌ Lỗi ghi frame video: {e_write}")
+                        # Có thể dừng ghi nếu lỗi liên tục?
+
+            # 4. Đưa frame vào queue cho worker (nếu đang xử lý)
+            if self.processing:
+                # Tạo bản sao frame để gửi cho worker
+                frame_to_process = processing_frame.copy()
+                if not self.frame_queue.full():
+                    try:
+                        self.frame_queue.put(frame_to_process, block=False) # Non-blocking
+                        if hasattr(self, 'last_queue_full_err'): delattr(self,'last_queue_full_err')
+                    except Exception as q_put_err:
+                         # Log lỗi đưa vào queue (hiếm)
+                         current_time = time.time()
+                         if not hasattr(self,'last_q_put_err') or current_time - getattr(self,'last_q_put_err', 0) > 5:
+                            self.log_activity(f"❌ Lỗi đưa frame vào queue: {q_put_err}")
+                            setattr(self,'last_q_put_err', current_time)
+                else:
+                    # Log lỗi queue đầy định kỳ
+                    current_time = time.time()
+                    if not hasattr(self, 'last_queue_full_err') or current_time - getattr(self, 'last_queue_full_err', 0) > 5:
+                         self.log_activity("⚠️ Queue xử lý đầy, frame bị bỏ qua.")
+                         setattr(self, 'last_queue_full_err', current_time)
+
+        except Exception as e:
+            # Bắt lỗi chung trong update_frame
+            current_time = time.time()
+            if not hasattr(self,'last_update_frame_err') or current_time - getattr(self,'last_update_frame_err', 0) > 5:
+                 self.log_activity(f"❌ Lỗi trong update_frame: {e}")
+                 self.log_activity(traceback.format_exc())
+                 setattr(self,'last_update_frame_err', current_time)
+
+
+    def stop_webcam(self):
+        """Dừng webcam và dọn dẹp tài nguyên."""
+        if self.cap and self.cap.isOpened():
+            try:
+                self.frame_timer.stop() # Dừng timer trước
+                self.cap.release()
+            except Exception as e:
+                 self.log_activity(f"⚠️ Lỗi khi dừng webcam: {e}")
+            finally:
+                 self.cap = None
+                 self.scene.clear()
+                 self.pixmap_item = None
+                 self.graphicsView.setBackgroundBrush(QtGui.QBrush(Qt.darkGray))
+                 self.log_activity("🚫 Webcam đã tắt.")
+                 # Cập nhật trạng thái nút
+                 self.ONCam.setEnabled(True)
+                 self.OFFCam.setEnabled(False)
+                 self.SettingButton_ROI_Webcam.setEnabled(False)
+                 # Vô hiệu hóa nút chụp ảnh
+                 for btn in [self.CaptureButton_Norm, self.CaptureButton_Shut, self.CaptureButton_Fail]:
+                      btn.setEnabled(False)
+                 # Tự động dừng xử lý nếu đang chạy
+                 if self.processing:
+                     self.log_activity("ℹ️ Tự động dừng xử lý do webcam tắt.")
+                     self.toggle_processing() # Gọi hàm dừng chuẩn
+        elif self.cap is None:
+            self.log_activity("ℹ️ Webcam chưa được bật để dừng.")
+        # else: # Trường hợp self.cap tồn tại nhưng not isOpened() (lỗi trước đó)
+        #     self.log_activity("ℹ️ Webcam đang ở trạng thái lỗi, bỏ qua.")
+        #     pass
+
+
+    # --- load_reference_image, capture_reference_from_webcam giữ nguyên ---
+    def load_reference_image(self, img_type):
+        if self.processing:
+             QMessageBox.warning(self, "Đang xử lý", "Không thể thay đổi ảnh tham chiếu khi đang xử lý.")
+             return
+        if self.current_comparison_method != METHOD_SSIM:
+             # Chỉ cảnh báo, vẫn cho phép tải
+             QMessageBox.information(self, "Thông tin", f"Ảnh tham chiếu hiện chỉ được sử dụng cho phương thức {METHOD_SSIM}.")
+
+        opts=QFileDialog.Options()
+        # Thư mục gợi ý: thư mục ảnh cũ -> thư mục lỗi -> home
+        suggested_dir = os.path.expanduser("~") # Mặc định
+        current_path = self.config['ref_paths'].get(img_type)
+        if current_path and os.path.exists(os.path.dirname(current_path)):
+            suggested_dir = os.path.dirname(current_path)
+        elif self.error_folder and os.path.exists(self.error_folder):
+            suggested_dir = self.error_folder
+
+        fp, _ = QFileDialog.getOpenFileName(
+            self, f"Chọn ảnh tham chiếu '{img_type}' (cho SSIM)", suggested_dir,
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp);;All Files (*)", options=opts)
+
+        if fp:
+            try:
+                img_bytes = np.fromfile(fp, dtype=np.uint8)
+                img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError("Không thể giải mã file ảnh hoặc định dạng không được hỗ trợ.")
+
+                # Cập nhật dữ liệu và config
+                self.ref_data[img_type] = img
+                self.config['ref_paths'][img_type] = fp # Lưu đường dẫn mới
+                self.update_button_styles() # Cập nhật UI nút
+                self.log_activity(f"✅ Đã tải ảnh '{img_type}' (SSIM) từ: {os.path.basename(fp)}")
+                # self.save_config() # Có thể không cần lưu ngay
+
+            except Exception as e:
+                self.log_activity(f"❌ Lỗi tải ảnh {img_type} từ '{fp}': {e}")
+                QMessageBox.warning(self, "Lỗi Tải Ảnh", f"Không thể tải ảnh:\n{fp}\n\nLỗi: {e}")
+                # Xóa đường dẫn nếu tải lỗi? (tùy chọn)
+                # self.config['ref_paths'][img_type] = None
+                # self.ref_data[img_type] = None
+                # self.update_button_styles()
+
+
+    def capture_reference_from_webcam(self, img_type):
+        if not self.cap or not self.cap.isOpened():
+             QMessageBox.warning(self,"Webcam Chưa Bật","Vui lòng bật webcam trước khi chụp.")
+             return
+        if self.processing:
+             QMessageBox.warning(self,"Đang Xử Lý","Không thể chụp ảnh khi đang xử lý.")
+             return
+        if self.current_comparison_method != METHOD_SSIM:
+             QMessageBox.information(self, "Thông tin", f"Chụp ảnh tham chiếu hiện chỉ áp dụng cho {METHOD_SSIM}.")
+             # Vẫn cho phép chụp
+
+        # Tạm dừng timer đọc frame để lấy ảnh ổn định
+        was_active = self.frame_timer.isActive()
+        if was_active: self.frame_timer.stop(); time.sleep(0.1) # Chờ chút
+
+        ret, frame = self.cap.read() # Đọc frame hiện tại
+
+        # Khởi động lại timer nếu cần
+        if was_active and self.cap and self.cap.isOpened():
+            self.frame_timer.start()
+
+        if not ret or frame is None:
+            QMessageBox.warning(self,"Lỗi Đọc Frame","Không thể lấy ảnh từ webcam.")
+            return
+
+        try:
+            # Quyết định lưu frame gốc hay frame đã crop ROI? Hiện tại lưu gốc.
+            frame_to_save = frame.copy()
+            # Lưu ảnh và cập nhật config
+            self.ref_data[img_type] = frame_to_save
+            self.config['ref_paths'][img_type] = None # Đánh dấu là chụp từ webcam
+            self.log_activity(f"📸 Đã chụp ảnh '{img_type}' (SSIM) từ webcam.")
+            self.update_button_styles() # Cập nhật UI nút
+            # self.save_config()
+
+        except Exception as e:
+            self.log_activity(f"❌ Lỗi khi lưu ảnh chụp {img_type}: {e}")
+            QMessageBox.critical(self,"Lỗi Chụp Ảnh",f"Đã xảy ra lỗi: {e}")
+
+
+    # --- select_webcam_roi, select_error_folder, serial functions giữ nguyên ---
+    def select_webcam_roi(self):
+        if not self.cap or not self.cap.isOpened():
+            QMessageBox.warning(self, "Webcam Chưa Bật", "Vui lòng bật webcam trước.")
+            return
+        if self.processing:
+            QMessageBox.warning(self, "Đang Xử Lý", "Không thể chọn ROI khi đang xử lý.")
+            return
+
+        was_active = self.frame_timer.isActive()
+        if was_active: self.frame_timer.stop(); time.sleep(0.1)
+        ret, frame = self.cap.read()
+        # Không bật lại timer ngay để cửa sổ ROI tĩnh
+
+        if not ret or frame is None:
+            if was_active and self.cap and self.cap.isOpened(): self.frame_timer.start() # Bật lại nếu lỗi đọc
+            QMessageBox.warning(self, "Lỗi Đọc Frame", "Không thể lấy ảnh để chọn ROI.")
+            return
+
+        try:
+            # Đặt tên cửa sổ dễ hiểu
+            window_name = "Chon ROI - Keo chuot roi Enter/Space (C/ESC=Huy, R=Reset)"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL) # Cho phép resize cửa sổ
+            cv2.resizeWindow(window_name, 800, 600) # Kích thước cửa sổ ban đầu
+            cv2.setWindowTitle(window_name, window_name)
+
+            # Vẽ hướng dẫn lên ảnh (tùy chọn)
+            frame_roi_select = frame.copy()
+            # ... (có thể thêm cv2.putText hướng dẫn) ...
+
+            # Hiển thị cửa sổ chọn ROI của OpenCV
+            roi = cv2.selectROI(window_name, frame_roi_select, showCrosshair=True, fromCenter=False)
+            cv2.destroyWindow(window_name) # Đóng cửa sổ chọn ROI
+
+            # Bật lại timer webcam sau khi đóng cửa sổ chọn
+            if was_active and self.cap and self.cap.isOpened():
+                self.frame_timer.start()
+
+            # Xử lý kết quả trả về từ selectROI
+            if roi == (0, 0, 0, 0): # Người dùng hủy (nhấn ESC/C hoặc đóng cửa sổ)
+                self.log_activity("ℹ️ Đã hủy chọn ROI.")
+                return
+
+            # Kiểm tra ROI hợp lệ (w > 0 và h > 0)
+            if roi[2] > 0 and roi[3] > 0:
+                # Chuyển sang tuple số nguyên không âm
+                self.webcam_roi = tuple(max(0, int(v)) for v in roi)
+                self.config['webcam_roi'] = list(self.webcam_roi) # Lưu vào config
+                self.log_activity(f"✅ Đã chọn ROI mới: {self.webcam_roi}")
+                # self.save_config() # Lưu config
+            else:
+                self.log_activity("⚠️ ROI không hợp lệ (w=0 hoặc h=0), không áp dụng.")
+                self.webcam_roi = None # Reset ROI nếu không hợp lệ
+                self.config['webcam_roi'] = None
+
+            # Cập nhật style nút ROI
+            self.update_button_styles()
+
+        except Exception as e:
+            self.log_activity(f"❌ Lỗi trong quá trình chọn ROI: {e}")
+            self.log_activity(traceback.format_exc())
+            QMessageBox.critical(self, "Lỗi Chọn ROI", f"Đã xảy ra lỗi:\n{e}")
+            cv2.destroyAllWindows() # Đảm bảo đóng mọi cửa sổ OpenCV nếu lỗi
+            # Bật lại timer nếu cần và chưa bật
+            if was_active and self.cap and self.cap.isOpened() and not self.frame_timer.isActive():
+                self.frame_timer.start()
+
+    def select_error_folder(self):
+        if self.processing:
+            QMessageBox.warning(self, "Đang Xử Lý", "Không thể thay đổi thư mục khi đang xử lý.")
+            return
+
+        opts = QFileDialog.Options() | QFileDialog.ShowDirsOnly
+        # Thư mục gợi ý: thư mục cũ hoặc thư mục home
+        suggested_dir = self.error_folder or os.path.expanduser("~")
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Chọn thư mục lưu ảnh lỗi, video và log", suggested_dir, opts)
+
+        if folder: # Nếu người dùng đã chọn
+            # Kiểm tra quyền ghi
+            if not os.access(folder, os.W_OK):
+                QMessageBox.warning(self, "Không Có Quyền Ghi",
+                                  f"Không thể ghi vào thư mục:\n{folder}\n\nVui lòng chọn thư mục khác hoặc kiểm tra quyền.")
+                return
+
+            # Chỉ cập nhật nếu thư mục thực sự thay đổi
+            if self.error_folder != folder:
+                self.error_folder = folder
+                self.config['error_folder'] = folder
+                self.log_activity(f"📁 Đã chọn thư mục lỗi: {self.error_folder}")
+                # Cập nhật đường dẫn file log
+                self.log_file_path = os.path.join(self.error_folder, LOG_FILE_NAME)
+                self.log_activity(f"📄 File log sẽ ghi tại: {self.log_file_path}")
+                # Ghi thử vào log mới (tùy chọn)
+                self.log_activity("📝 (Thử ghi log vào thư mục mới)")
+                # self.save_config() # Lưu cấu hình
+                self.update_button_styles() # Cập nhật style nút
+
+    @QtCore.pyqtSlot()
+    def _refresh_com_ports(self):
+        if self.serial_enabled:
+            self.log_activity("ℹ️ Ngắt kết nối COM trước khi làm mới danh sách.")
+            return
+
+        self.comPortComboBox.blockSignals(True)
+        current_selection = self.comPortComboBox.currentText()
+        self.comPortComboBox.clear()
+        port_names = []
+        try:
+            ports = serial.tools.list_ports.comports()
+            port_names = sorted([port.device for port in ports])
+            if port_names: self.log_activity(f"🔄 COM ports found: {', '.join(port_names)}")
+            else: self.log_activity("🔄 No COM ports found.")
+        except Exception as e:
+            self.log_activity(f"❌ Lỗi liệt kê cổng COM: {e}")
+
+        if not port_names:
+             self.comPortComboBox.addItem("Không tìm thấy cổng")
+             self.comPortComboBox.setEnabled(False)
+             self.serial_port_name = None
+        else:
+            self.comPortComboBox.addItems(port_names)
+            self.comPortComboBox.setEnabled(True)
+            if current_selection in port_names:
+                 self.comPortComboBox.setCurrentText(current_selection)
+                 self.serial_port_name = current_selection
+            else: # Chọn cổng đầu tiên nếu cổng cũ không còn
+                 self.comPortComboBox.setCurrentIndex(0)
+                 new_selection = self.comPortComboBox.currentText()
+                 if current_selection and "Không tìm thấy" not in current_selection:
+                     self.log_activity(f"⚠️ COM '{current_selection}' không còn. Chọn '{new_selection}'.")
+                 self.serial_port_name = new_selection # Cập nhật state
+
+        # Cập nhật config và UI
+        self.config['serial_port'] = self.serial_port_name
+        self.comPortComboBox.blockSignals(False)
+        self.update_serial_button_style()
+        # Bật/tắt combobox Baudrate dựa trên việc có cổng hay không
+        self.baudRateComboBox.setEnabled(bool(port_names))
+
+    @QtCore.pyqtSlot()
+    def _toggle_serial_port(self):
+        if self.processing:
+            QMessageBox.warning(self, "Đang Xử Lý", "Không thể thay đổi kết nối COM khi đang xử lý.")
+            return
+
+        if not self.serial_enabled: # --- Logic KẾT NỐI ---
+            port = self.comPortComboBox.currentText()
+            baud = self.serial_baud_rate
+            if not port or "Không tìm thấy" in port:
+                QMessageBox.warning(self, "Chưa Chọn Cổng", "Vui lòng chọn cổng COM hợp lệ.")
+                return
+
+            # Đóng cổng cũ (nếu có) trước khi mở cổng mới
+            if self.serial_port and self.serial_port.is_open:
+                try: self.serial_port.close()
+                except Exception: pass
+
+            try:
+                self.log_activity(f"🔌 Đang kết nối {port} @ {baud} baud...")
+                # Thêm timeout khi ghi để tránh treo
+                self.serial_port = serial.Serial(port, baud, timeout=0.1, write_timeout=1.0)
+                # ---- Kết nối thành công ----
+                self.serial_enabled = True
+                self.serial_port_name = port # Cập nhật tên cổng thực tế
+                self.config['serial_enabled'] = True # Lưu trạng thái (dù sẽ reset khi tải)
+                self.config['serial_port'] = port
+                self.config['serial_baud'] = baud
+                self.log_activity(f"✅ Đã kết nối COM: {port}")
+                # Vô hiệu hóa cấu hình COM khi đang kết nối
+                self.comPortComboBox.setEnabled(False)
+                self.baudRateComboBox.setEnabled(False)
+                self.refreshComButton.setEnabled(False)
+
+            except serial.SerialException as e:
+                self.log_activity(f"❌ Lỗi mở cổng COM '{port}': {e}")
+                QMessageBox.critical(self, "Lỗi Kết Nối COM", f"Không thể mở cổng {port}.\nLỗi: {e}\nKiểm tra driver hoặc cổng có đang bị dùng bởi chương trình khác?")
+                self.serial_port = None; self.serial_enabled = False
+                self.config['serial_enabled'] = False
+                # Cho phép cấu hình lại nếu lỗi
+                has_ports = self.comPortComboBox.count() > 0 and "Không tìm thấy" not in self.comPortComboBox.itemText(0)
+                self.comPortComboBox.setEnabled(has_ports)
+                self.baudRateComboBox.setEnabled(has_ports)
+                self.refreshComButton.setEnabled(True)
+            except Exception as e_unk: # Lỗi không xác định khác
+                self.log_activity(f"❌ Lỗi không xác định khi mở COM '{port}': {e_unk}")
+                self.log_activity(traceback.format_exc())
+                QMessageBox.critical(self, "Lỗi Nghiêm Trọng", f"Lỗi không mong muốn khi kết nối COM.\nLỗi: {e_unk}")
+                self.serial_port = None; self.serial_enabled = False
+                self.config['serial_enabled'] = False
+                has_ports = self.comPortComboBox.count() > 0 and "Không tìm thấy" not in self.comPortComboBox.itemText(0)
+                self.comPortComboBox.setEnabled(has_ports); self.baudRateComboBox.setEnabled(has_ports); self.refreshComButton.setEnabled(True)
+
+        else: # --- Logic NGẮT KẾT NỐI ---
+            port_to_close = self.serial_port_name or "N/A"
+            try:
+                if self.serial_port and self.serial_port.is_open:
+                    self.log_activity(f"🔌 Đang ngắt kết nối COM: {port_to_close}...")
+                    self.serial_port.close()
+                    self.log_activity(f"🔌 Đã ngắt kết nối COM.")
+            except serial.SerialException as e:
+                 self.log_activity(f"⚠️ Lỗi khi đóng cổng COM '{port_to_close}': {e}")
+            except Exception as e_unk:
+                 self.log_activity(f"⚠️ Lỗi không xác định khi đóng COM '{port_to_close}': {e_unk}")
+            finally:
+                 # Luôn dọn dẹp và cập nhật UI/state
+                 self.serial_port = None
+                 self.serial_enabled = False
+                 self.config['serial_enabled'] = False
+                 # Bật lại các control cấu hình COM
+                 has_ports = self.comPortComboBox.count() > 0 and "Không tìm thấy" not in self.comPortComboBox.itemText(0)
+                 self.comPortComboBox.setEnabled(has_ports)
+                 self.baudRateComboBox.setEnabled(has_ports)
+                 self.refreshComButton.setEnabled(True)
+
+        # Cập nhật style nút Connect/Disconnect
+        self.update_serial_button_style()
+        # self.save_config() # Lưu trạng thái mới
+
+    @QtCore.pyqtSlot(str)
+    def _send_serial_command(self, command):
+        """Gửi lệnh (chuỗi) qua cổng serial đã mở."""
+        if self.serial_enabled and self.serial_port and self.serial_port.is_open:
+            try:
+                # Đảm bảo lệnh kết thúc bằng newline
+                cmd_with_newline = command if command.endswith('\n') else command + '\n'
+                byte_command = cmd_with_newline.encode('utf-8') # Chuyển sang bytes
+                bytes_written = self.serial_port.write(byte_command)
+                # Có thể cần flush để đảm bảo gửi ngay lập tức
+                # self.serial_port.flush()
+                if bytes_written == len(byte_command):
+                     # Log thành công (có thể giảm bớt nếu quá nhiều)
+                     # self.log_activity(f"➡️ Gửi COM [{self.serial_port_name}]: {command}")
+                     pass
+                else: # Ghi không đủ byte (hiếm khi xảy ra với write_timeout)
+                     self.log_activity(f"⚠️ Gửi COM [{self.serial_port_name}] không đủ byte: {command} ({bytes_written}/{len(byte_command)} bytes)")
+
+            except serial.SerialTimeoutException: # Lỗi timeout khi ghi
+                self.log_activity(f"⚠️ Timeout khi gửi lệnh COM tới '{self.serial_port_name}'.")
+                # Cân nhắc tự động ngắt kết nối nếu lỗi này lặp lại?
+            except serial.SerialException as e: # Lỗi serial khác khi ghi
+                self.log_activity(f"❌ Lỗi nghiêm trọng khi gửi lệnh COM: {e}. Tự động ngắt kết nối.")
+                QMessageBox.critical(self, "Lỗi Gửi COM", f"Không thể gửi dữ liệu tới {self.serial_port_name}.\nKết nối sẽ bị đóng.\nLỗi: {e}")
+                self._toggle_serial_port() # Gọi hàm ngắt kết nối
+            except Exception as e_unk: # Lỗi không xác định
+                 self.log_activity(f"❌ Lỗi không xác định khi gửi lệnh COM: {e_unk}. Ngắt kết nối.")
+                 self.log_activity(traceback.format_exc())
+                 QMessageBox.critical(self, "Lỗi Gửi COM", f"Lỗi không mong muốn khi gửi dữ liệu.\nKết nối sẽ bị đóng.\nLỗi: {e_unk}")
+                 self._toggle_serial_port()
+
+
+    # --- _select_yolo_model_path, _load_yolo_model giữ nguyên ---
+    @QtCore.pyqtSlot()
+    def _select_yolo_model_path(self):
+        """Mở dialog cho phép người dùng chọn file model YOLO .pt."""
+        if self.processing:
+             QMessageBox.warning(self, "Đang Xử Lý", "Không thể thay đổi model khi đang xử lý.")
+             return
+        opts = QFileDialog.Options()
+        # Thư mục gợi ý: thư mục model cũ hoặc thư mục home
+        current_path = self.config.get('yolo_model_path')
+        suggested_dir = os.path.dirname(current_path) if current_path and os.path.isdir(os.path.dirname(current_path)) else os.path.expanduser("~")
+
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn Model YOLOv8 (.pt)", suggested_dir,
+                                            "PyTorch Models (*.pt);;All Files (*)", options=opts)
+        if fp:
+            # Chỉ xử lý nếu đường dẫn thực sự thay đổi
+            if self.config.get('yolo_model_path') != fp:
+                self.config['yolo_model_path'] = fp
+                self.log_activity(f"📁 Chọn model YOLO mới: {os.path.basename(fp)}")
+                # Cập nhật label hiển thị đường dẫn
+                self.yoloModelPathLabel.setText(os.path.basename(fp))
+                self.yoloModelPathLabel.setStyleSheet("font-style: normal; color: black;") # Bỏ italic
+                self.yoloModelPathLabel.setToolTip(fp) # Đặt tooltip là đường dẫn đầy đủ
+
+                # Giải phóng model cũ và thử tải model mới
+                if self.yolo_model is not None:
+                    del self.yolo_model; self.yolo_model = None
+                    # Có thể thêm cleanup GPU nếu cần: if torch: torch.cuda.empty_cache()
+                    self.log_activity("🧠 Đã giải phóng model YOLO cũ.")
+
+                self._load_yolo_model() # Thử tải model mới ngay lập tức
+                # self.save_config() # Lưu config (tùy chọn, có thể đợi)
+
+    def _load_yolo_model(self):
+        """Tải model YOLO từ đường dẫn trong config. Trả về True nếu thành công."""
+        if not YOLO_AVAILABLE:
+            # self.log_activity("⚠️ Thư viện YOLOv8 chưa cài đặt.") # Đã log ở init
+            return False
+
+        model_path = self.config.get('yolo_model_path')
+        if not model_path or not isinstance(model_path, str):
+            self.log_activity("⚠️ Chưa cấu hình đường dẫn model YOLO.")
+            return False
+
+        # Kiểm tra nếu model đã tải và cùng đường dẫn -> không cần tải lại
+        if self.yolo_model and hasattr(self.yolo_model, 'ckpt_path') and self.yolo_model.ckpt_path == model_path:
+             # self.log_activity("ℹ️ Model YOLO đã được tải (không đổi).")
+             return True # Đã tải đúng model
+
+        # Nếu có model cũ khác, giải phóng trước
+        if self.yolo_model is not None:
+            self.log_activity("🧠 Giải phóng model YOLO cũ...")
+            del self.yolo_model; self.yolo_model = None
+            # if torch and torch.cuda.is_available(): torch.cuda.empty_cache()
+
+        # Bắt đầu tải model mới
+        self.log_activity(f"⏳ Đang tải model YOLO: {os.path.basename(model_path)}...")
+        # Cập nhật UI để báo đang tải
+        self.details_label.setText("Details: Đang tải model YOLO...")
+        QtWidgets.QApplication.processEvents() # Buộc cập nhật UI ngay
+
+        try:
+            # === TẢI MODEL ===
+            self.yolo_model = YOLO(model_path) # Có thể mất thời gian / treo UI!
+            # === TẢI XONG ===
+
+            # Tùy chọn: Chạy thử một dự đoán nhỏ để "warm-up" model
+            # try:
+            #     dummy_img = np.zeros((64, 64, 3), dtype=np.uint8)
+            #     self.yolo_model.predict(dummy_img, verbose=False)
+            # except Exception as wu_err:
+            #     self.log_activity(f"⚠️ Lỗi khi warm-up model: {wu_err}") # Không nghiêm trọng
+
+            self.log_activity(f"✅ Model YOLO '{os.path.basename(model_path)}' đã tải.")
+            self.details_label.setText("Details: Model YOLO đã tải.") # Cập nhật UI
+            return True # Trả về True khi thành công
+
+        except Exception as e:
+            # Lỗi nghiêm trọng khi tải model
+            load_error_msg = f"Không thể tải model:\n{model_path}\n\nLỗi: {e}"
+            self.log_activity(f"❌ Lỗi nghiêm trọng tải model YOLO: {e}")
+            self.log_activity(traceback.format_exc()) # Ghi traceback để debug
+            QMessageBox.critical(self, "Lỗi Tải Model YOLO", load_error_msg)
+            # Đảm bảo model là None nếu lỗi
+            self.yolo_model = None
+            # Cập nhật UI báo lỗi
+            self.details_label.setText("Details: Lỗi tải model YOLO.")
+            # Reset đường dẫn trong UI và config nếu tải lỗi?
+            self.config['yolo_model_path'] = None
+            self.yoloModelPathLabel.setText("Lỗi tải model!")
+            self.yoloModelPathLabel.setStyleSheet("font-style: italic; color: red;")
+            self.yoloModelPathLabel.setToolTip("")
+            return False # Trả về False khi thất bại
+
+
+    # --- toggle_processing, _mark_error_occurred, disable_settings_while_processing,
+    #      _runtime_timer_timeout giữ nguyên ---
+    def toggle_processing(self):
+        # --- Kiểm tra điều kiện trước khi BẮT ĐẦU ---
+        if not self.processing:
+            # Kiểm tra theo phương thức
+            if self.current_comparison_method == METHOD_SSIM:
+                if not isinstance(self.ref_data.get(REF_NORM), np.ndarray) or self.ref_data[REF_NORM].size == 0:
+                    QMessageBox.warning(self, "Thiếu Ảnh Tham Chiếu", f"Vui lòng tải/chụp ảnh '{REF_NORM}' (cho SSIM) trước.")
+                    return
+            elif self.current_comparison_method == METHOD_YOLO:
+                if not self.yolo_model: # Model chưa được tải?
+                    if not self.config.get('yolo_model_path'):
+                         QMessageBox.warning(self, "Thiếu Model YOLO", "Vui lòng chọn đường dẫn model YOLO trong cấu hình.")
+                         return
+                    else:
+                         # Đã có đường dẫn nhưng model chưa tải (có thể do lỗi trước đó) -> Thử tải lại
+                         self.log_activity("ℹ️ Model YOLO chưa tải, đang thử tải lại...")
+                         if not self._load_yolo_model(): # Nếu tải lại vẫn lỗi
+                              QMessageBox.warning(self, "Lỗi Tải Model", "Không thể tải model YOLO. Vui lòng kiểm tra đường dẫn và file.")
+                              return
+                         # Nếu tải lại thành công, tiếp tục
+                # Thêm kiểm tra quy tắc YOLO nếu cần (ví dụ: đã định nghĩa chưa?)
+            # Kiểm tra chung
+            if not self.error_folder or not os.path.isdir(self.error_folder) or not os.access(self.error_folder, os.W_OK):
+                 QMessageBox.warning(self, "Thiếu Thư Mục Lỗi", "Vui lòng chọn thư mục hợp lệ (có quyền ghi) để lưu lỗi/log/video.")
+                 return
+            if not self.cap or not self.cap.isOpened():
+                 QMessageBox.warning(self, "Webcam Chưa Bật", "Vui lòng bật webcam trước.")
+                 return
+
+        # --- Chuyển đổi trạng thái processing ---
+        self.processing = not self.processing
+
+        if self.processing: # --- Logic BẮT ĐẦU ---
+            self.log_activity(f"▶️ Bắt đầu xử lý (Phương thức: {self.current_comparison_method})...")
+            self.save_config() # Lưu cấu hình hiện tại trước khi chạy
+
+            # Lấy hàm so sánh tương ứng
+            compare_func = self.comparison_functions.get(self.current_comparison_method)
+            if not compare_func:
+                self.log_activity(f"❌ Lỗi nghiêm trọng: Không tìm thấy hàm xử lý cho phương thức '{self.current_comparison_method}'.")
+                self.processing = False # Hủy bắt đầu
+                self.update_toggle_button_text() # Cập nhật lại nút Start
+                return
+
+            # Dọn dẹp worker cũ (nếu có)
+            if self.processing_worker and self.processing_worker.isRunning():
+                self.log_activity("⚙️ Dừng worker cũ...")
+                self.processing_worker.stop()
+                if not self.processing_worker.wait(1500): # Chờ tối đa 1.5s
+                    self.log_activity("⚠️ Worker cũ không dừng kịp thời!")
+                # Ngắt kết nối tín hiệu cũ? Thường không cần nếu đối tượng bị xóa
+                # try: self.processing_worker.signals_disconnected.disconnect() # Ví dụ
+                # except TypeError: pass
+
+            # Dọn sạch frame cũ trong queue
+            cleared_count = 0
+            while not self.frame_queue.empty():
+                try: self.frame_queue.get_nowait(); cleared_count += 1
+                except Empty: break
+            if cleared_count > 0: self.log_activity(f"ℹ️ Đã dọn {cleared_count} frame cũ.")
+
+            # Tạo và khởi chạy worker MỚI
+            self.processing_worker = ProcessingWorker(
+                self.frame_queue,
+                self.get_reference_data_for_worker, # Cung cấp data phù hợp (ảnh/rules)
+                self.get_current_config_for_worker, # Cung cấp config cần thiết
+                compare_func                     # Truyền hàm so sánh cụ thể
+            )
+            # Kết nối tín hiệu từ worker mới đến các slot của Main thread
+            self.processing_worker.log_signal.connect(self.log_activity)
+            self.processing_worker.status_signal.connect(self.update_status_label)
+            self.processing_worker.save_error_signal.connect(self.save_error_image_from_thread)
+            self.processing_worker.comparison_details_signal.connect(self.update_details_display)
+            self.processing_worker.error_detected_signal.connect(self._mark_error_occurred)
+            self.processing_worker.serial_command_signal.connect(self._send_serial_command)
+
+            # Bắt đầu worker
+            self.processing_worker.last_error_time = 0 # Reset cooldown
+            self.processing_worker.start()
+
+            # Cập nhật UI trạng thái bắt đầu
+            self.update_status_label(ComparisonStatus.UNKNOWN, {"status": "Starting..."}) # Trạng thái khởi tạo
+
+            # Bắt đầu timer hẹn giờ chạy (nếu có cấu hình)
+            if self._current_runtime_minutes > 0:
+                duration_ms = self._current_runtime_minutes * 60 * 1000
+                self.runtime_timer.start(duration_ms)
+                self.log_activity(f"⏱️ Hẹn giờ tự động dừng sau {self._current_runtime_minutes} phút.")
+            else: # Đảm bảo timer đã dừng nếu không dùng
+                if self.runtime_timer.isActive(): self.runtime_timer.stop()
+
+            # Reset trạng thái ghi video
+            self.video_writer = None; self.current_video_path = None; self.error_occurred_during_recording = False
+
+            # Vô hiệu hóa các control cấu hình
+            self.disable_settings_while_processing(True)
+
+        else: # --- Logic DỪNG ---
+            self.log_activity("⏹ Đang dừng xử lý...")
+            # Gửi tín hiệu dừng cho worker
+            if self.processing_worker and self.processing_worker.isRunning():
+                self.processing_worker.stop()
+                # Không cần wait lâu ở đây, worker sẽ tự kết thúc khi self.running=False
+
+            # Dừng timer hẹn giờ
+            if self.runtime_timer.isActive():
+                self.runtime_timer.stop()
+                self.log_activity("⏱️ Đã hủy hẹn giờ dừng.")
+
+            # Hoàn tất việc ghi video (nếu đang ghi)
+            if self.video_writer is not None:
+                vp = self.current_video_path # Lưu đường dẫn trước khi release
+                try:
+                    self.video_writer.release()
+                    self.log_activity("⚪️ Đã dừng ghi video.")
+                    # Kiểm tra và xử lý file video cuối cùng
+                    if vp and os.path.exists(vp):
+                        if not self.error_occurred_during_recording: # Không có lỗi -> xóa
+                             try: os.remove(vp); self.log_activity(f"🗑️ Đã xóa video (không lỗi): {os.path.basename(vp)}")
+                             except Exception as e_rem: self.log_activity(f"⚠️ Lỗi khi xóa video '{os.path.basename(vp)}': {e_rem}")
+                        else: # Có lỗi -> giữ lại
+                             self.log_activity(f"💾 Đã lưu video (có lỗi): {os.path.basename(vp)}")
+                except Exception as e_vid_rel:
+                    self.log_activity(f"❌ Lỗi khi giải phóng VideoWriter: {e_vid_rel}")
+                finally:
+                    self.video_writer = None; self.current_video_path = None
+                    self.error_occurred_during_recording = False
+
+            # Cập nhật UI trạng thái dừng
+            self.update_status_label(ComparisonStatus.UNKNOWN, {"status": "Stopped"})
+            self.details_label.setText("Details: N/A") # Reset chi tiết
+
+            # Kích hoạt lại các control cấu hình
+            self.disable_settings_while_processing(False)
+            self.log_activity("⏹ Quá trình xử lý đã dừng.")
+
+        # Cập nhật text nút Start/Stop
+        self.update_toggle_button_text()
+
+
+    @QtCore.pyqtSlot()
+    def _mark_error_occurred(self):
+        """Đánh dấu là đã có lỗi xảy ra trong phiên ghi video hiện tại."""
+        if self._record_on_error_enabled and not self.error_occurred_during_recording:
+            self.log_activity("❗ Phát hiện lỗi đầu tiên. Video sẽ được lưu khi dừng.")
+        self.error_occurred_during_recording = True
+
+
+    def disable_settings_while_processing(self, disable):
+        """Bật/tắt các control cấu hình dựa trên trạng thái processing."""
+        is_ssim = self.current_comparison_method == METHOD_SSIM
+        is_yolo = self.current_comparison_method == METHOD_YOLO
+        webcam_on = self.cap is not None and self.cap.isOpened()
+
+        # 1. Các control chung
+        self.comparisonMethodComboBox.setEnabled(not disable)
+        self.SaveButton.setEnabled(not disable)
+        self.cooldownSpinBox.setEnabled(not disable)
+        self.runtimeSpinBox.setEnabled(not disable)
+        self.ToggleRecordOnErrorButton.setEnabled(not disable)
+
+        # 2. Các control theo phương thức
+        # Bật group tương ứng nếu không disable VÀ đúng phương thức
+        self.ssimGroup.setEnabled(not disable and is_ssim)
+        self.yoloGroup.setEnabled(not disable and is_yolo)
+
+        # 3. Nút ảnh tham chiếu (liên quan đến SSIM)
+        # Có thể luôn bật nút tải, chỉ bật nút chụp khi có webcam và là SSIM?
+        can_use_ssim_refs = not disable # Hiện tại cho phép tương tác khi không processing
+        for btn in [self.SettingButton_Norm, self.SettingButton_Shutdown, self.SettingButton_Fail]:
+            btn.setEnabled(can_use_ssim_refs)
+        for btn in [self.CaptureButton_Norm, self.CaptureButton_Shut, self.CaptureButton_Fail]:
+            # Bật nếu không xử lý, có webcam, VÀ đang ở chế độ SSIM (hoặc luôn bật nếu muốn)
+            btn.setEnabled(can_use_ssim_refs and webcam_on and is_ssim)
+
+        # 4. Nút ROI (chỉ khi có webcam và không xử lý)
+        self.SettingButton_ROI_Webcam.setEnabled(not disable and webcam_on)
+
+        # 5. Cấu hình Serial
+        self.serialGroup.setEnabled(not disable) # Luôn bật group khi không xử lý
+        can_config_serial = not disable and not self.serial_enabled
+        has_ports = hasattr(self, 'comPortComboBox') and self.comPortComboBox.count() > 0 and "Không tìm thấy" not in self.comPortComboBox.itemText(0)
+        self.comPortComboBox.setEnabled(can_config_serial and has_ports)
+        self.baudRateComboBox.setEnabled(can_config_serial and has_ports)
+        # Nút refresh chỉ bị vô hiệu hóa khi đang kết nối
+        self.refreshComButton.setEnabled(not self.serial_enabled)
+        # Nút Kết nối/Ngắt kết nối: Bật nếu không xử lý và có cổng
+        self.ToggleSerialPortButton.setEnabled(not disable and has_ports)
+
+        # 6. Nút Webcam
+        self.ONCam.setEnabled(not disable and not webcam_on)
+        self.OFFCam.setEnabled(not disable and webcam_on)
+
+
+    @QtCore.pyqtSlot()
+    def _runtime_timer_timeout(self):
+        self.log_activity(f"⏱️ Đã hết thời gian chạy ({self._current_runtime_minutes} phút).")
+        QMessageBox.information(self,"Hết Giờ",f"Đã chạy đủ {self._current_runtime_minutes} phút. Ứng dụng sẽ đóng.")
+        # Tự động dừng xử lý trước khi đóng
+        if self.processing:
+             self.toggle_processing() # Gọi hàm dừng chuẩn
+        # Gọi hàm đóng ứng dụng
+        self.close_application()
+
+
+    # --- comparison_ssim_strategy, compare_yolo_strategy, _check_yolo_rule giữ nguyên ---
+    def compare_ssim_strategy(self, frame, ref_images, config):
+        """So sánh SSIM và trả về (ComparisonStatus, details)."""
+        ssim_th = config.get('ssim_threshold', DEFAULT_SSIM_THRESHOLD)
+        n_img = ref_images.get(REF_NORM)
+        s_img = ref_images.get(REF_SHUTDOWN)
+        f_img = ref_images.get(REF_FAIL)
+        details = {}
+
+        # Bắt buộc phải có ảnh Norm
+        if not isinstance(n_img, np.ndarray) or n_img.size == 0:
+            return ComparisonStatus.ERROR, {"error": "Ảnh Norm không hợp lệ"}
+
+        score_n = ssim_opencv(frame, n_img)
+        details["ssim_norm"] = score_n # Luôn thêm score Norm vào details
+        if score_n is None: # Lỗi tính toán SSIM
+            return ComparisonStatus.ERROR, {"error": "Lỗi tính SSIM vs Norm", **details}
+        if score_n >= ssim_th: # Khớp Norm
+            return ComparisonStatus.NORMAL, details
+
+        # Nếu không khớp Norm, kiểm tra Shutdown (nếu có)
+        if isinstance(s_img, np.ndarray) and s_img.size > 0:
+            score_s = ssim_opencv(frame, s_img)
+            details["ssim_shutdown"] = score_s # Thêm score Shutdown
+            if score_s is not None and score_s >= ssim_th:
+                return ComparisonStatus.SHUTDOWN, details
+
+        # Nếu không khớp Norm/Shutdown, kiểm tra Fail (nếu có)
+        if isinstance(f_img, np.ndarray) and f_img.size > 0:
+            score_f = ssim_opencv(frame, f_img)
+            details["ssim_fail"] = score_f # Thêm score Fail
+            if score_f is not None and score_f >= ssim_th:
+                return ComparisonStatus.FAIL, details
+
+        # Nếu không khớp bất kỳ ảnh tham chiếu nào
+        return ComparisonStatus.UNKNOWN, details
+
+
+    def compare_yolo_strategy(self, frame, yolo_rules, config):
+        """So sánh YOLO dựa trên rules và trả về (ComparisonStatus, details)."""
+        if not YOLO_AVAILABLE or self.yolo_model is None:
+            return ComparisonStatus.ERROR, {"error": "YOLO không sẵn sàng"}
+        conf_threshold = config.get('yolo_confidence', DEFAULT_YOLO_CONFIDENCE)
+
+        try:
+            # === Thực hiện dự đoán YOLO ===
+            results = self.yolo_model.predict(frame, conf=conf_threshold, verbose=False, imgsz=max(32,frame.shape[0],frame.shape[1])) # Kích thước động?
+            if not results or len(results) == 0:
+                 return ComparisonStatus.ERROR, {"error": "YOLO predict không trả về kết quả"}
+            # ==============================
+
+            detections = results[0] # Lấy kết quả cho ảnh đầu tiên (và duy nhất)
+            detected_objects = {}   # Dictionary {class_name: count}
+            object_details_list = [] # List chứa thông tin chi tiết từng box (tùy chọn)
+            obj_count = 0           # Tổng số đối tượng phát hiện được
+
+            # Trích xuất thông tin từ kết quả dự đoán
+            if detections.boxes is not None and detections.names is not None:
+                 obj_count = len(detections.boxes)
+                 for i in range(obj_count): # Lặp qua index thay vì đối tượng box trực tiếp
+                     try:
+                         box = detections.boxes[i] # Lấy đối tượng box theo index
+                         class_id = int(box.cls.item())
+                         class_name = detections.names.get(class_id, f"ID_{class_id}")
+                         confidence = float(box.conf.item())
+                         # Lấy tọa độ hộp giới hạn (ví dụ: normalized xywh)
+                         bbox_xywhn = box.xywhn.cpu().numpy()[0]
+
+                         # Đếm số lượng theo class name
+                         detected_objects[class_name] = detected_objects.get(class_name, 0) + 1
+                         # Thêm chi tiết (tùy chọn)
+                         object_details_list.append({
+                             "class": class_name, "conf": confidence,
+                             "box_norm": [round(c, 4) for c in bbox_xywhn]
+                         })
+                     except Exception as box_err:
+                          # Log lỗi xử lý box cụ thể mà không dừng toàn bộ
+                          # Trong ứng dụng thực tế nên dùng self.log_signal
+                          print(f"Warning: Lỗi xử lý YOLO box: {box_err}")
+                          continue # Bỏ qua box lỗi này
+
+            # Tạo dictionary chi tiết kết quả
+            details = {"detected": detected_objects, "count": obj_count}
+            # if object_details_list: details["boxes"] = object_details_list # Thêm chi tiết box nếu cần
+
+            # === Áp dụng quy tắc ===
+            norm_rules = yolo_rules.get(REF_NORM, {})
+            shut_rules = yolo_rules.get(REF_SHUTDOWN, {})
+            fail_rules = yolo_rules.get(REF_FAIL, {})
+
+            # Ưu tiên kiểm tra FAIL -> SHUTDOWN -> NORMAL
+            is_fail, fail_reason = self._check_yolo_rule(detected_objects, fail_rules)
+            if is_fail:
+                details["reason"] = fail_reason
+                return ComparisonStatus.FAIL, details
+
+            is_shut, shut_reason = self._check_yolo_rule(detected_objects, shut_rules)
+            if is_shut:
+                details["reason"] = shut_reason
+                return ComparisonStatus.SHUTDOWN, details
+
+            is_norm, norm_reason = self._check_yolo_rule(detected_objects, norm_rules)
+            if is_norm:
+                details["reason"] = norm_reason
+                return ComparisonStatus.NORMAL, details
+
+            # Nếu không khớp quy tắc nào
+            details["reason"] = "Không khớp quy tắc nào"
+            return ComparisonStatus.UNKNOWN, details
+
+        except Exception as e:
+            # Lỗi trong quá trình dự đoán hoặc xử lý kết quả YOLO
+            err_msg = f"YOLO Exception: {type(e).__name__}: {e}"
+            print(f"💥 {err_msg}") # In ra console để debug nhanh
+            traceback.print_exc()    # In traceback đầy đủ
+            # Có thể dùng self.log_signal nếu muốn ghi vào log chính thức
+            return ComparisonStatus.ERROR, {"error": err_msg}
+
+
+    def _check_yolo_rule(self, detected_objects, rules):
+        """Kiểm tra xem các đối tượng phát hiện có khớp với bộ quy tắc không.
+        Trả về: (bool: True nếu khớp, False nếu không, str: Lý do khớp/không khớp)
+        """
+        if not rules: return False, "Không có quy tắc để kiểm tra"
+
+        reasons = [] # Lưu lại lý do vi phạm hoặc khớp
+        match_overall = True # Giả định là khớp ban đầu
+
+        # --- Kiểm tra các loại quy tắc ---
+
+        # 1. Quy tắc "any_of": Cần ít nhất một đối tượng trong danh sách
+        any_of_list = rules.get("any_of")
+        if any_of_list and isinstance(any_of_list, list):
+            found_any = False
+            for obj_name in any_of_list:
+                if detected_objects.get(obj_name, 0) > 0:
+                    found_any = True; break
+            if not found_any:
+                match_overall = False
+                reasons.append(f"Thiếu một trong các đối tượng bắt buộc 'any_of': {', '.join(any_of_list)}")
+            else: # Khớp quy tắc 'any_of'
+                # Nếu 'any_of' là quy tắc DUY NHẤT, trả về khớp ngay
+                if len(rules) == 1: return True, f"Tìm thấy một trong 'any_of': {', '.join(any_of_list)}"
+                reasons.append(f"Khớp 'any_of': tìm thấy một trong {', '.join(any_of_list)}") # Ghi nhận khớp
+            # Nếu 'any_of' không khớp, trả về ngay (vì đây là điều kiện HOẶC)
+            if not match_overall: return False, "; ".join(reasons)
+
+        # 2. Quy tắc "required_objects" và "min_counts": Các đối tượng bắt buộc phải có đủ số lượng
+        required_list = rules.get("required_objects", [])
+        min_counts_dict = rules.get("min_counts", {})
+        if required_list: # Chỉ kiểm tra nếu có danh sách yêu cầu
+             rule_violated = False
+             temp_reasons = []
+             for req_obj in required_list:
+                 req_count = min_counts_dict.get(req_obj, 1) # Mặc định cần ít nhất 1
+                 actual_count = detected_objects.get(req_obj, 0)
+                 if actual_count < req_count:
+                     rule_violated = True
+                     temp_reasons.append(f"Thiếu '{req_obj}' (cần {req_count}, có {actual_count})")
+             if rule_violated:
+                 match_overall = False
+                 reasons.extend(temp_reasons)
+             else: reasons.append("Khớp 'required_objects'") # Ghi nhận khớp
+
+        # 3. Quy tắc "forbidden_objects": Các đối tượng không được phép xuất hiện
+        forbidden_list = rules.get("forbidden_objects", [])
+        if forbidden_list:
+            rule_violated = False
+            temp_reasons = []
+            for fob_obj in forbidden_list:
+                if detected_objects.get(fob_obj, 0) > 0:
+                    rule_violated = True
+                    temp_reasons.append(f"Phát hiện đối tượng cấm '{fob_obj}'")
+            if rule_violated:
+                match_overall = False
+                reasons.extend(temp_reasons)
+            else: reasons.append("Khớp 'forbidden_objects'")
+
+        # 4. Quy tắc "max_total_objects": Giới hạn tổng số đối tượng tối đa
+        max_total = rules.get("max_total_objects")
+        if max_total is not None: # Chỉ kiểm tra nếu có giá trị
+            current_total = sum(detected_objects.values())
+            if current_total > max_total:
+                match_overall = False
+                reasons.append(f"Quá nhiều đối tượng (tối đa {max_total}, có {current_total})")
+            else: reasons.append("Khớp 'max_total_objects'")
+
+        # 5. Quy tắc "exact_total_objects": Yêu cầu chính xác tổng số đối tượng
+        exact_total = rules.get("exact_total_objects")
+        if exact_total is not None:
+            current_total = sum(detected_objects.values())
+            if current_total != exact_total:
+                match_overall = False
+                reasons.append(f"Sai tổng số đối tượng (cần {exact_total}, có {current_total})")
+            else: reasons.append("Khớp 'exact_total_objects'")
+
+        # Kết luận cuối cùng
+        if match_overall:
+            if not reasons: return True, "Khớp (không có quy tắc cụ thể)" # Trường hợp rules={}
+            return True, "; ".join(filter(lambda r: not r.startswith("Khớp"), reasons)) or "Tất cả quy tắc khớp" # Ưu tiên lý do vi phạm nếu có lẫn lộn
+        else:
+            return False, "; ".join(filter(lambda r: not r.startswith("Khớp"), reasons)) # Chỉ trả về lý do vi phạm
+
+
+    # --- save_error_image_from_thread, close_application, closeEvent giữ nguyên ---
+    @QtCore.pyqtSlot(np.ndarray, str)
+    def save_error_image_from_thread(self, frame_copy, file_path):
+        try:
+            save_dir = os.path.dirname(file_path)
+            if not os.path.exists(save_dir): os.makedirs(save_dir, exist_ok=True)
+            # Sử dụng imencode để xử lý định dạng PNG và nén
+            success, buf = cv2.imencode('.png', frame_copy, [cv2.IMWRITE_PNG_COMPRESSION, 3]) # Mức nén vừa phải
+            if not success or buf is None:
+                raise ValueError("cv2.imencode thất bại.")
+            # Ghi buffer vào file
+            with open(file_path, "wb") as f:
+                f.write(buf.tobytes())
+            self.log_activity(f"💾 Lưu ảnh lỗi: {os.path.basename(file_path)}")
+        except Exception as e:
+            self.log_activity(f"❌ Lỗi khi lưu ảnh lỗi '{os.path.basename(file_path)}': {e}")
+            self.log_activity(traceback.format_exc()) # Log traceback vì đây là luồng chính
+
+    def close_application(self):
+        """Đóng ứng dụng một cách an toàn."""
+        self.log_activity("🚪 Đang yêu cầu đóng ứng dụng...")
+        self.close() # Kích hoạt sự kiện closeEvent
+
+    def closeEvent(self, event):
+        """Xử lý sự kiện đóng cửa sổ, dọn dẹp tài nguyên."""
+        self.log_activity("🚪 Bắt đầu quá trình dọn dẹp trước khi đóng...")
+
+        # 1. Dừng các Timers
+        if self.runtime_timer.isActive(): self.runtime_timer.stop()
+        if self.frame_timer.isActive(): self.frame_timer.stop()
+
+        # 2. Dừng Worker thread
+        worker_stopped_cleanly = True
+        if self.processing_worker and self.processing_worker.isRunning():
+            self.log_activity("⚙️ Dừng luồng xử lý...")
+            self.processing_worker.stop()
+            # Chờ worker dừng một chút
+            if not self.processing_worker.wait(2000): # Chờ tối đa 2 giây
+                self.log_activity("⚠️ Luồng xử lý không dừng kịp thời!")
+                worker_stopped_cleanly = False
+            # else: self.log_activity("✅ Luồng xử lý đã dừng.")
+        self.processing = False # Đặt cờ processing về False
+
+        # 3. Giải phóng Webcam
+        if self.cap and self.cap.isOpened():
+            try: self.cap.release()
+            except Exception: pass # Bỏ qua lỗi release
+            finally: self.cap = None; self.log_activity("🚫 Webcam đã giải phóng.")
+
+        # 4. Hoàn tất ghi Video
+        if self.video_writer is not None:
+            vp = self.current_video_path
+            try:
+                self.video_writer.release()
+                self.log_activity("⚪️ Video writer đã giải phóng.")
+                if vp and os.path.exists(vp):
+                    if not self.error_occurred_during_recording:
+                         try: os.remove(vp); self.log_activity(f"🗑️ Đã xóa video cuối (không lỗi).")
+                         except Exception as e: self.log_activity(f"⚠️ Lỗi xóa video cuối: {e}")
+                    else:
+                         self.log_activity(f"💾 Đã lưu video cuối (có lỗi).")
+            except Exception as e: self.log_activity(f"❌ Lỗi giải phóng VideoWriter: {e}")
+            finally: self.video_writer, self.current_video_path = None, None
+
+        # 5. Đóng cổng Serial
+        if self.serial_port and self.serial_port.is_open:
+            port_name = self.serial_port.name or "N/A"
+            try: self.serial_port.close(); self.log_activity(f"🔌 Đã đóng cổng COM {port_name}.")
+            except Exception as e: self.log_activity(f"⚠️ Lỗi đóng COM {port_name}: {e}")
+            finally: self.serial_port = None; self.serial_enabled = False
+
+        # 6. Dọn sạch Queue
+        # (Vòng lặp while đã sửa ở các phiên bản trước)
+        q_size = self.frame_queue.qsize()
+        if q_size > 0: self.log_activity(f"ℹ️ Dọn {q_size} frame còn lại trong queue...")
+        while not self.frame_queue.empty():
+            try: self.frame_queue.get_nowait()
+            except Empty: break
+
+        # 7. Giải phóng Model YOLO
+        if self.yolo_model is not None:
+             self.log_activity("🧠 Giải phóng model YOLO...")
+             del self.yolo_model; self.yolo_model = None
+             # Optional: GPU cleanup if using PyTorch explicitly
+             # try:
+             #     import torch
+             #     if torch.cuda.is_available(): torch.cuda.empty_cache()
+             # except ImportError: pass
+             # except Exception as e_cuda: print(f"Note: Lỗi cleanup CUDA: {e_cuda}")
+
+        # 8. Lưu cấu hình lần cuối
+        self.log_activity("💾 Lưu cấu hình cuối cùng...")
+        self.save_config()
+
+        self.log_activity("🚪 Dọn dẹp hoàn tất. Tạm biệt!")
+        # Ghi dòng log cuối vào file
+        if self.log_file_path:
+             try:
+                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                 with open(self.log_file_path,"a",encoding="utf-8") as lf:
+                      lf.write(f"---\n{timestamp} - Ứng dụng đã đóng\n---\n")
+             except Exception as e: print(f"Lỗi ghi log cuối: {e}")
+
+        event.accept() # Chấp nhận sự kiện đóng
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Cài đặt cho màn hình HiDPI (nếu có)
+    if hasattr(QtCore.Qt, 'AA_EnableHighDpiScaling'):
+         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(QtCore.Qt, 'AA_UseHighDpiPixmaps'):
+         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+
+    # Khởi tạo ứng dụng Qt
+    app = QtWidgets.QApplication(sys.argv)
+    # Tạo và hiển thị cửa sổ chính
+    window = ImageCheckerApp()
+    window.show()
+    # Bắt đầu vòng lặp sự kiện của ứng dụng
+    sys.exit(app.exec_())
