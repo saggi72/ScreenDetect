@@ -3,3 +3,41 @@ pip install PyQt5
 pip install opencv-python
 pip install numpy
 pip install pyserial
+pip install PyQt5 opencv-python numpy pyserial ultralytics
+Use code with caution.
+Bash
+Giải thích các thư viện:
+
+PyQt5: Thư viện giao diện người dùng đồ họa (GUI) mà chương trình sử dụng để tạo cửa sổ, nút bấm, v.v.
+
+opencv-python: Thư viện OpenCV, dùng cho các tác vụ xử lý ảnh như đọc/ghi ảnh, thay đổi kích thước, chuyển đổi không gian màu, và tính toán SSIM. Lưu ý tên package khi cài đặt là opencv-python, không phải cv2.
+
+numpy: Thư viện nền tảng cho tính toán khoa học, đặc biệt là làm việc với mảng đa chiều (hình ảnh được biểu diễn dưới dạng mảng NumPy). OpenCV phụ thuộc nhiều vào NumPy.
+
+pyserial: Thư viện để giao tiếp với cổng nối tiếp (COM port), dùng để gửi tín hiệu đến các thiết bị khác (như Arduino). Lưu ý tên package là pyserial, không phải serial.
+
+ultralytics: Thư viện chính thức chứa YOLOv8, dùng cho việc phát hiện đối tượng. Thư viện này cũng sẽ tự động cài đặt các phụ thuộc của nó, bao gồm cả PyTorch (thường là phiên bản CPU theo mặc định).
+
+Khuyến nghị:
+
+Sử dụng Môi trường ảo (Virtual Environment): Rất nên tạo và kích hoạt một môi trường ảo trước khi chạy lệnh pip install để tránh xung đột thư viện với các dự án khác hoặc với hệ thống Python của bạn.
+
+# Tạo môi trường ảo (ví dụ tên là 'venv')
+python -m venv venv
+
+# Kích hoạt môi trường ảo
+# Windows:
+.\venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+# Sau đó chạy lệnh pip install ở trên
+pip install PyQt5 opencv-python numpy pyserial ultralytics
+
+# Khi làm việc xong, bạn có thể hủy kích hoạt:
+deactivate
+Use code with caution.
+Bash
+YOLOv8 và GPU: Nếu bạn muốn YOLOv8 chạy trên GPU (để tăng tốc độ đáng kể), bạn cần cài đặt phiên bản PyTorch phù hợp với driver CUDA của bạn trước khi hoặc cùng lúc cài ultralytics. Hãy tham khảo trang web chính thức của PyTorch (https://pytorch.org/get-started/locally/) để lấy lệnh cài đặt chính xác cho hệ điều hành và phiên bản CUDA của bạn. Sau đó, bạn có thể chạy lại lệnh pip install ultralytics ... nếu cần.
+
+Chạy lệnh pip install trên sẽ tải và cài đặt các thư viện cần thiết để bạn có thể thực thi mã nguồn Python.
